@@ -14,9 +14,9 @@ Target hardware:
 ## Fungsi firmware aktif
 
 1. Web UI hotspot dengan tab Ringkasan, Audio, Infrared, Meter, dan Sistem.
-2. Belajar command `ON` dan `OFF` dari remote AC asli.
-3. Mengatur suhu 16-30 lewat `IRremoteESP8266` / `IRac` common A/C API.
-4. Menyimpan raw IR ON/OFF dan protocol AC ke NVS ESP32.
+2. Belajar command `ON`, `OFF`, dan suhu 16–30 °C dari remote AC asli.
+3. Mengatur suhu lewat raw IR hasil learn, atau `IRremoteESP8266` / `IRac` common A/C API sebagai fallback.
+4. Menyimpan raw IR ON/OFF/suhu dan protocol AC ke NVS ESP32.
 5. Mengirim ulang command `ON`, `OFF`, atau state AC hanya saat tombol web ditekan.
 6. Receiver IR aktif hanya saat Learn atau Test Sensor.
 7. OLED/LCD dinonaktifkan karena hardware rusak; fungsi lain tetap berjalan normal.
@@ -61,9 +61,9 @@ pio device monitor -b 115200
 2. Buka `http://192.168.4.1`.
 3. Tekan `Learn ON`, lalu tekan tombol ON remote asli ke receiver.
 4. Tekan `Learn OFF`, lalu tekan tombol OFF remote asli ke receiver.
-5. Untuk suhu, buka menu `Config` dan pilih protocol AC. Jika Learn ON/OFF terbaca oleh library, protocol akan otomatis tersimpan.
-6. Pakai menu `Control` untuk `Nyalakan AC`, `Matikan AC`, pilih suhu/mode/fan, lalu tekan `Kirim State AC`.
-7. Pakai menu `Speaker` untuk mengatur volume, mengucapkan teks, atau menghentikan suara.
+5. Di tab **Infrared**, pilih suhu 16–30 °C pada bagian **Learn suhu AC**, set remote asli ke suhu itu, lalu tekan `Learn suhu` dan tekan tombol remote sekali.
+6. Gunakan `Kirim suhu` untuk menguji rekaman. Ulangi untuk suhu lain yang diperlukan.
+7. Jika belum ada hasil learn untuk suatu suhu, firmware memakai protocol AC yang terdeteksi/diatur sebagai fallback.
 
 ## Uji hardware firmware aktif
 
@@ -77,7 +77,40 @@ pio device monitor -b 115200
 Sampel suara tersimpan sebagai PCM 8-bit di flash sehingga uji bicara speaker tidak membutuhkan
 internet dan tidak memakai buffer audio besar di RAM.
 
-Text-to-speech memerlukan koneksi WiFi internet. Server Access Token disimpan lokal di
+## Voice Assistant
+
+Voice assistant memakai VAD/RMS lokal untuk mulai dan berhenti merekam. Hanya potongan yang
+terdeteksi sebagai ucapan yang dikirim ke Wit.ai sebagai PCM 8 kHz untuk speech-to-text. Jawaban
+speaker dirangkai dari potongan suara Indonesia di `src/voice_prompts.h`, sehingga respons tidak
+memerlukan cloud TTS.
+
+Sinyal microphone dikondisikan dengan penghilangan DC offset, peredam spike impulsif, noise
+floor adaptif, dan hysteresis VAD. Setelah boot, biarkan area microphone tenang selama 3 detik.
+Jika lingkungan berubah atau deteksi terlalu sensitif, buka tab **Audio**, tekan
+**Kalibrasi Noise**, kemudian diam dan jangan menyentuh microphone selama 3 detik. Web UI akan
+menampilkan RMS terkondisi, noise floor, ambang bicara, dan jumlah spike yang dibuang.
+Trigger voice assistant juga menolak bunyi bip pendek atau nada dengan level konstan. Awal ucapan
+tetap dipertahankan oleh pre-roll 300 ms. Buffer rekaman 5 detik dialokasikan statis agar proses
+rekam tidak gagal karena fragmentasi heap WiFi/TLS.
+
+Alur yang paling stabil adalah dua tahap:
+
+1. Ucapkan **“Halo Stroomer”**, tunggu jawaban **“Siap”**.
+2. Dalam 15 detik ucapkan salah satu perintah strict berikut:
+   - `berapa tegangan`
+   - `berapa arus`
+   - `berapa daya`
+   - `nyalakan AC`
+   - `matikan AC`
+   - `setting AC`
+   - `set suhu dua puluh lima derajat` (rentang 16–30)
+
+Saat `setting AC`, perangkat meminta tombol ON lalu OFF dari remote asli. Untuk keandalan paling
+tinggi, rekam suhu yang dipakai pada tab **Infrared**; frame raw hasil learn akan diprioritaskan
+daripada protocol umum. Status transcript, protocol, dan error STT dapat dilihat pada tab
+**Audio**. Audio microphone dikirim ke Wit.ai dan fitur ini membutuhkan koneksi internet.
+
+Speech-to-text memerlukan koneksi WiFi internet. Server Access Token disimpan lokal di
 `include/WitAiSecrets.h`; file tersebut diabaikan oleh Git. Gunakan
 `include/WitAiSecrets.example.h` sebagai template.
 
@@ -88,6 +121,24 @@ Text-to-speech memerlukan koneksi WiFi internet. Server Access Token disimpan lo
 3. Setelah STA connected, alat otomatis connect ke MQTT broker `broker.emqx.io:1883`.
 4. Topic control ditampilkan di menu `WiFi`: `hems/ac/<id esp>/ctr`.
 
+Payload state berfungsi sekaligus sebagai heartbeat MQTT. Interval default adalah 30 detik dan
+dapat diubah pada tab **System → MQTT Heartbeat** dalam rentang 5–3600 detik. Nilai disimpan di
+NVS sehingga tetap berlaku setelah restart. Polling Modbus tetap berjalan setiap 3 detik dan tidak
+mengikuti interval heartbeat. Payload heartbeat menyertakan `meterValid` dan `heartbeatSec`.
+
+## Demand response, alarm, dan sesi energi
+
+- Pada tab **System → Demand Response**, aktifkan jadwal diskon dengan jam mulai dan selesai WIB.
+  Jadwal menggunakan NTP dan dapat melewati tengah malam. Saat mulai/selesai, perangkat mengirim
+  event MQTT dan memainkan pola bunyi berbeda. Jika jadwal tidak diaktifkan, fitur tidak berdampak.
+- Pada tab **System → Alarm Kelistrikan**, isi ambang tegangan minimum, tegangan maksimum, dan
+  daya maksimum dalam Watt. Nilai `0` berarti alarm tersebut nonaktif. Alarm berbunyi satu kali
+  saat nilai menembus ambang dan hanya siap berbunyi lagi setelah kondisi kembali normal.
+- Sesi energi dimulai saat daya aktif lebih dari **10 W** dan selesai saat di bawah **10 W**.
+  Saat start/stop, firmware mengirim event pada `<prefix>/<id esp>/event` serta memaksa heartbeat
+  state segera. Payload state memuat `energySessionActive`, `EnergySession`, dan
+  `lastEnergySession`.
+
 Contoh payload MQTT:
 
 ```text
@@ -97,7 +148,42 @@ temp=24
 protocol=midea
 {"cmd":"set","temp":24,"mode":"cool","fan":"auto"}
 {"cmd":"set","temp":24,"mode":"cool","fan":"auto","protocol":"midea"}
+tegangan
+arus
+daya
 ```
+
+Perilaku command kontrol:
+
+- `on` dan `off` mengirim raw IR ON/OFF yang sudah dipelajari. Jika raw belum tersedia, firmware
+  mencoba common AC state dengan protocol aktif.
+- `protocol=midea` memilih dan menyimpan protocol AC ke NVS. Nama protocol harus didukung `IRac`.
+- `temp=24` memakai rekaman raw suhu 24 °C bila sudah di-learn pada Web UI. Jika belum ada,
+  firmware mengirim state ON, mode cool, fan auto lewat protocol aktif. Jika belum ada protocol
+  yang dikenali, firmware memakai dan menyimpan `MIDEA` sebagai fallback default agar transmitter
+  tetap mengirim; fallback ini belum tentu cocok dengan merek/model AC.
+- JSON `cmd=set` dapat mengatur `temp` (16–30), `mode` (`auto`, `cool`, `heat`, `dry`, `fan`),
+  `fan` (`auto`, `min`, `low`, `medium`, `high`, `max`), dan opsional `protocol`.
+- Hasil command terakhir dapat diperiksa di tab **System** dan status IR di tab **Infrared**.
+
+Untuk meminta perangkat membacakan nilai meter, publish payload teks `tegangan`, `arus`, atau
+`daya` ke topic:
+
+```text
+hems/ac/<id esp>/ctr
+```
+
+Contoh dengan Mosquitto:
+
+```bash
+mosquitto_pub -h broker.emqx.io -t 'hems/ac/<id esp>/ctr' -m 'tegangan'
+mosquitto_pub -h broker.emqx.io -t 'hems/ac/<id esp>/ctr' -m 'arus'
+mosquitto_pub -h broker.emqx.io -t 'hems/ac/<id esp>/ctr' -m 'daya'
+```
+
+Topic lengkap ditampilkan pada tab **System** di Web UI. Kirim command tanpa opsi retain agar
+perangkat tidak mengulang ucapan lama setelah reconnect. Nilai yang dibacakan adalah pembacaan
+Modbus valid terakhir; jika meter belum tersedia, speaker mengatakan bahwa meter tidak tersedia.
 
 ## Pin sementara
 

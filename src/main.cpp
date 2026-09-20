@@ -4,17 +4,23 @@
 #include <Adafruit_SSD1306.h>
 #include <IRrecv.h>
 #include <IRsend.h>
+#include <IRac.h>
 #include <IRutils.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <math.h>
+#include <time.h>
 #include "voice_sample.h"
+#include "voice_prompts.h"
 #include "web_ui.h"
+#include "WitAiSecrets.h"
 
 // ============================================================
 // DEVICE A - FACTORY / MODBUS TEST FIRMWARE
@@ -77,16 +83,27 @@ static const uint32_t WIFI_RETRY_INTERVAL_MS = 12000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t MQTT_RETRY_INTERVAL_MS = 5000;
 static const uint16_t MQTT_BUFFER_SIZE = 1536;
-static const float SESSION_ACTIVE_POWER_THRESHOLD_KW = 0.05f;
+static const uint32_t MQTT_HEARTBEAT_DEFAULT_SEC = 30;
+static const uint32_t MQTT_HEARTBEAT_MIN_SEC = 5;
+static const uint32_t MQTT_HEARTBEAT_MAX_SEC = 3600;
+static const float SESSION_ACTIVE_POWER_THRESHOLD_KW = 0.01f; // 10 Watt
+static const char *NTP_SERVER_PRIMARY = "pool.ntp.org";
+static const char *NTP_SERVER_SECONDARY = "time.google.com";
+static const char *DEVICE_TIMEZONE = "WIB-7";
+static const uint8_t DEMAND_RESPONSE_HOUR_MAX = 23;
 
 static const uint8_t MODBUS_FUNCTION_READ = 0x03;
 static const uint16_t MODBUS_START_REGISTER = 0;
 static const uint16_t MODBUS_REGISTER_COUNT = 17;
 static const uint8_t IR_SEND_KHZ = 38;
+static const decode_type_t DEFAULT_AC_PROTOCOL = decode_type_t::MIDEA;
 static const uint16_t IR_CAPTURE_BUFFER_SIZE = 1024;
 static const uint8_t IR_TIMEOUT_MS = 50;
 static const uint16_t IR_MIN_RAW_LEN = 12;
 static const uint16_t IR_MAX_RAW_LEN = 750;
+static const uint8_t IR_TEMP_MIN_C = 16;
+static const uint8_t IR_TEMP_MAX_C = 30;
+static const uint8_t IR_TEMP_SLOT_COUNT = IR_TEMP_MAX_C - IR_TEMP_MIN_C + 1;
 static const uint32_t AMP_SAMPLE_RATE = 22050;
 static const uint16_t AMP_CHUNK_FRAMES = 96;
 static const i2s_port_t AMP_I2S_PORT = I2S_NUM_0;
@@ -95,7 +112,22 @@ static const float AMP_TWO_PI = 6.28318530718f;
 static const uint32_t MIC_SAMPLE_RATE = 16000;
 static const uint16_t MIC_CHUNK_SAMPLES = 128;
 static const uint32_t MIC_TEST_DURATION_MS = 4000;
-static const uint16_t MIC_SPEECH_RMS_THRESHOLD = 30;
+static const uint16_t MIC_VAD_MIN_START = 70;
+static const uint16_t MIC_VAD_MIN_CONTINUE = 45;
+static const uint32_t MIC_CALIBRATION_MS = 3000;
+static const uint32_t VOICE_MAX_RECORD_MS = 5000;
+static const uint32_t VOICE_STT_SAMPLE_RATE = 8000;
+static const size_t VOICE_MAX_SAMPLES = VOICE_STT_SAMPLE_RATE * VOICE_MAX_RECORD_MS / 1000;
+static const uint32_t VOICE_TRIGGER_SETTLE_MS = 80;
+static const uint32_t VOICE_TRIGGER_HOLD_MS = 240;
+static const uint32_t VOICE_TRIGGER_REJECT_MS = 900;
+static const uint32_t VOICE_PREROLL_MS = 300;
+static const size_t VOICE_PREROLL_SAMPLES = VOICE_STT_SAMPLE_RATE * VOICE_PREROLL_MS / 1000;
+static const uint32_t VOICE_SILENCE_STOP_MS = 750;
+static const uint32_t VOICE_MIN_RECORD_MS = 500;
+static const uint32_t VOICE_WAKE_WINDOW_MS = 15000;
+static const uint32_t VOICE_SPEAKER_GUARD_MS = 900;
+static const char *WIT_SPEECH_URL = "https://api.wit.ai/speech?v=20240919";
 
 // Jika pembacaan 32-bit terlihat tidak masuk akal, ubah menjadi true.
 static const bool MODBUS_SWAP_32BIT_WORDS = false;
@@ -115,7 +147,8 @@ enum IrLearnSlot
 {
   IR_LEARN_NONE,
   IR_LEARN_ON,
-  IR_LEARN_OFF
+  IR_LEARN_OFF,
+  IR_LEARN_TEMPERATURE
 };
 
 struct MeterData
@@ -152,6 +185,10 @@ uint16_t rawIrOn[IR_MAX_RAW_LEN] = {0};
 uint16_t rawIrOff[IR_MAX_RAW_LEN] = {0};
 uint16_t rawIrOnLen = 0;
 uint16_t rawIrOffLen = 0;
+// Raw frame suhu dibaca dari NVS hanya saat akan dikirim, agar RAM tetap hemat.
+uint16_t rawIrTemperature[IR_MAX_RAW_LEN] = {0};
+uint16_t rawIrTemperatureLen[IR_TEMP_SLOT_COUNT] = {0};
+uint8_t irLearnTemperature = 24;
 IrLearnSlot irLearnSlot = IR_LEARN_NONE;
 bool irReceiverActive = false;
 String irStatus = "IR belum init";
@@ -175,11 +212,57 @@ String microphoneStatus = "Belum init";
 String microphoneTestResult = "Belum dites";
 uint32_t microphoneRms = 0;
 uint32_t microphonePeak = 0;
+uint32_t microphoneNoiseFloor = 20;
+uint32_t microphoneVadThreshold = MIC_VAD_MIN_START;
+uint32_t microphoneSpikeCount = 0;
+uint32_t microphoneCalibrationUntilMs = 0;
+bool microphoneCalibrationActive = false;
+float microphoneDcEstimate = 0.0f;
 uint32_t microphoneTestMaxRms = 0;
 uint32_t microphoneTestMaxPeak = 0;
 uint32_t microphoneChunks = 0;
 uint32_t microphoneErrors = 0;
 uint32_t microphoneTestStartedMs = 0;
+bool voiceCaptureActive = false;
+volatile bool voiceSttBusy = false;
+bool voiceAssistantEnabled = true;
+uint8_t voiceTriggerChunks = 0;
+int16_t voicePcmStorage[VOICE_MAX_SAMPLES] = {0};
+int16_t voicePreRoll[VOICE_PREROLL_SAMPLES] = {0};
+int16_t *voicePcm = voicePcmStorage;
+size_t voicePcmSamples = 0;
+size_t voicePreRollWrite = 0;
+size_t voicePreRollCount = 0;
+uint32_t voiceTriggerStartedMs = 0;
+uint32_t voiceTriggerMinRms = UINT32_MAX;
+uint32_t voiceTriggerMaxRms = 0;
+uint32_t voiceCaptureStartedMs = 0;
+uint32_t voiceLastSoundMs = 0;
+uint32_t voiceIgnoreUntilMs = 0;
+uint32_t voiceWakeUntilMs = 0;
+uint32_t voiceRecognitionCount = 0;
+uint32_t voiceRecognitionErrors = 0;
+String voiceAssistantStatus = "Menunggu ucapan Halo Stroomer";
+String voiceLastTranscript = "-";
+String voiceLastCommand = "-";
+struct VoiceRecognitionResult
+{
+  int16_t httpCode;
+  char transcript[192];
+  char error[96];
+};
+
+struct VoiceUploadJob
+{
+  int16_t *pcm;
+  size_t samples;
+};
+
+VoiceUploadJob voiceUploadJob = {voicePcmStorage, 0};
+
+QueueHandle_t voiceResultQueue = nullptr;
+uint8_t remoteSetupStep = 0;
+decode_type_t acProtocol = decode_type_t::UNKNOWN;
 String devicePrefix = DEFAULT_DEVICE_PREFIX;
 String wifiStaSsid = "";
 String wifiStaPassword = "";
@@ -189,19 +272,79 @@ uint32_t lastWifiStatusMs = 0;
 uint32_t lastWifiConnectAttemptMs = 0;
 String mqttDeviceId = "";
 String mqttStateTopic = "";
+String mqttCommandTopic = "";
+String mqttEventTopic = "";
 String mqttStatus = "MQTT belum init";
 String lastMqttPayload = "-";
+String mqttLastCommand = "-";
+String mqttLastCommandResult = "-";
 uint32_t lastMqttConnectAttemptMs = 0;
 uint32_t lastPublishedMeterReadMs = 0;
+uint32_t mqttHeartbeatIntervalMs = MQTT_HEARTBEAT_DEFAULT_SEC * 1000UL;
+uint32_t lastMqttHeartbeatMs = 0;
+uint32_t lastMqttHeartbeatAttemptMs = 0;
+bool mqttHeartbeatDue = true;
 uint32_t mqttOkCount = 0;
 uint32_t mqttErrCount = 0;
+uint32_t mqttCommandCount = 0;
+enum MqttVoiceRequest : uint8_t
+{
+  MQTT_VOICE_NONE,
+  MQTT_VOICE_VOLTAGE,
+  MQTT_VOICE_CURRENT,
+  MQTT_VOICE_POWER
+};
+MqttVoiceRequest pendingMqttVoiceRequest = MQTT_VOICE_NONE;
+enum MqttIrRequest : uint8_t
+{
+  MQTT_IR_NONE,
+  MQTT_IR_RAW_ON,
+  MQTT_IR_RAW_OFF,
+  MQTT_IR_SET_STATE,
+  MQTT_IR_SET_PROTOCOL
+};
+MqttIrRequest pendingMqttIrRequest = MQTT_IR_NONE;
+uint8_t mqttAcTemperature = 24;
+stdAc::opmode_t mqttAcMode = stdAc::opmode_t::kCool;
+stdAc::fanspeed_t mqttAcFan = stdAc::fanspeed_t::kAuto;
+decode_type_t pendingMqttProtocol = decode_type_t::UNKNOWN;
 bool energySessionActive = false;
 float energySessionStartKwh = 0.0f;
 float energySessionKwh = 0.0f;
+float energySessionLastKwh = 0.0f;
 uint32_t countSession = 0;
+bool demandResponseEnabled = false;
+uint8_t demandResponseStartHour = 0;
+uint8_t demandResponseEndHour = 0;
+bool demandResponseActive = false;
+bool demandResponseTimeInitialized = false;
+String demandResponseStatus = "Tidak diset";
+float alarmVoltageMin = 0.0f;
+float alarmVoltageMax = 0.0f;
+float alarmPowerMaxKw = 0.0f;
+bool alarmUnderVoltageActive = false;
+bool alarmOverVoltageActive = false;
+bool alarmOverPowerActive = false;
+String electricalAlarmStatus = "Tidak ada alarm";
+enum SystemAnnouncement : uint8_t
+{
+  ANNOUNCE_NONE = 0,
+  ANNOUNCE_DISCOUNT_STARTED = 1 << 0,
+  ANNOUNCE_DISCOUNT_ENDED = 1 << 1,
+  ANNOUNCE_UNDER_VOLTAGE = 1 << 2,
+  ANNOUNCE_OVER_VOLTAGE = 1 << 3,
+  ANNOUNCE_OVER_POWER = 1 << 4
+};
+uint8_t pendingSystemAnnouncements = ANNOUNCE_NONE;
 
 void drawOledText(const String &line1, const String &line2, const String &line3, const String &line4);
 void setIrReceiverActive(bool active);
+void serviceVoiceCapture(const int16_t *pcm, size_t samples, uint32_t rms);
+void serviceVoiceAssistant();
+void serviceSystemAnnouncements();
+void serviceDemandResponse();
+void checkElectricalAlarms();
+void publishMqttEvent(const char *eventName, const String &detail);
 
 String jsonEscape(const String &value)
 {
@@ -387,6 +530,171 @@ void updateMqttTopics()
   }
 
   mqttStateTopic = devicePrefix + "/" + mqttDeviceId + "/state";
+  mqttCommandTopic = devicePrefix + "/" + mqttDeviceId + "/ctr";
+  mqttEventTopic = devicePrefix + "/" + mqttDeviceId + "/event";
+}
+
+bool mqttJsonString(const String &json, const char *key, String &value)
+{
+  const String quotedKey = "\"" + String(key) + "\"";
+  int position = json.indexOf(quotedKey);
+  if (position < 0) return false;
+  position = json.indexOf(':', position + quotedKey.length());
+  if (position < 0) return false;
+  const int firstQuote = json.indexOf('"', position + 1);
+  if (firstQuote < 0) return false;
+  const int lastQuote = json.indexOf('"', firstQuote + 1);
+  if (lastQuote < 0) return false;
+  value = json.substring(firstQuote + 1, lastQuote);
+  value.trim();
+  value.toLowerCase();
+  return true;
+}
+
+bool mqttJsonInt(const String &json, const char *key, int &value)
+{
+  const String quotedKey = "\"" + String(key) + "\"";
+  int position = json.indexOf(quotedKey);
+  if (position < 0) return false;
+  position = json.indexOf(':', position + quotedKey.length());
+  if (position < 0) return false;
+  position++;
+  while (position < (int)json.length() && isspace((unsigned char)json[position])) position++;
+  const int start = position;
+  if (position < (int)json.length() && json[position] == '-') position++;
+  while (position < (int)json.length() && isDigit(json[position])) position++;
+  if (position == start) return false;
+  value = json.substring(start, position).toInt();
+  return true;
+}
+
+bool mqttParseMode(const String &text, stdAc::opmode_t &mode)
+{
+  if (text == "auto") mode = stdAc::opmode_t::kAuto;
+  else if (text == "cool") mode = stdAc::opmode_t::kCool;
+  else if (text == "heat") mode = stdAc::opmode_t::kHeat;
+  else if (text == "dry") mode = stdAc::opmode_t::kDry;
+  else if (text == "fan") mode = stdAc::opmode_t::kFan;
+  else return false;
+  return true;
+}
+
+bool mqttParseFan(const String &text, stdAc::fanspeed_t &fan)
+{
+  if (text == "auto") fan = stdAc::fanspeed_t::kAuto;
+  else if (text == "min") fan = stdAc::fanspeed_t::kMin;
+  else if (text == "low") fan = stdAc::fanspeed_t::kLow;
+  else if (text == "medium" || text == "med") fan = stdAc::fanspeed_t::kMedium;
+  else if (text == "high") fan = stdAc::fanspeed_t::kHigh;
+  else if (text == "max") fan = stdAc::fanspeed_t::kMax;
+  else return false;
+  return true;
+}
+
+void mqttMessageCallback(char *topic, byte *payload, unsigned int length)
+{
+  if (String(topic) != mqttCommandTopic || length == 0 || length > 256) return;
+
+  String command;
+  command.reserve(length);
+  for (unsigned int i = 0; i < length; i++) command += (char)payload[i];
+  command.trim();
+  command.toLowerCase();
+
+  if (command == "tegangan") pendingMqttVoiceRequest = MQTT_VOICE_VOLTAGE;
+  else if (command == "arus") pendingMqttVoiceRequest = MQTT_VOICE_CURRENT;
+  else if (command == "daya") pendingMqttVoiceRequest = MQTT_VOICE_POWER;
+  else if (command == "on") pendingMqttIrRequest = MQTT_IR_RAW_ON;
+  else if (command == "off") pendingMqttIrRequest = MQTT_IR_RAW_OFF;
+  else if (command.startsWith("temp="))
+  {
+    const int temperature = command.substring(5).toInt();
+    if (temperature < 16 || temperature > 30)
+    {
+      mqttStatus = "Suhu MQTT harus 16-30";
+      mqttLastCommandResult = mqttStatus;
+      return;
+    }
+    mqttAcTemperature = (uint8_t)temperature;
+    mqttAcMode = stdAc::opmode_t::kCool;
+    mqttAcFan = stdAc::fanspeed_t::kAuto;
+    pendingMqttIrRequest = MQTT_IR_SET_STATE;
+  }
+  else if (command.startsWith("protocol="))
+  {
+    const String name = command.substring(9);
+    const decode_type_t protocol = strToDecodeType(name.c_str());
+    if (!IRac::isProtocolSupported(protocol))
+    {
+      mqttStatus = "Protocol MQTT tidak didukung: " + name;
+      mqttLastCommandResult = mqttStatus;
+      return;
+    }
+    pendingMqttProtocol = protocol;
+    pendingMqttIrRequest = MQTT_IR_SET_PROTOCOL;
+  }
+  else if (command.startsWith("{"))
+  {
+    String cmd;
+    if (!mqttJsonString(command, "cmd", cmd) || cmd != "set")
+    {
+      mqttStatus = "JSON MQTT: cmd harus set";
+      mqttLastCommandResult = mqttStatus;
+      return;
+    }
+    int temperature = mqttAcTemperature;
+    mqttJsonInt(command, "temp", temperature);
+    if (temperature < 16 || temperature > 30)
+    {
+      mqttStatus = "JSON MQTT: temp harus 16-30";
+      mqttLastCommandResult = mqttStatus;
+      return;
+    }
+
+    stdAc::opmode_t mode = mqttAcMode;
+    stdAc::fanspeed_t fan = mqttAcFan;
+    String text;
+    if (mqttJsonString(command, "mode", text) && !mqttParseMode(text, mode))
+    {
+      mqttStatus = "JSON MQTT: mode tidak dikenal";
+      mqttLastCommandResult = mqttStatus;
+      return;
+    }
+    if (mqttJsonString(command, "fan", text) && !mqttParseFan(text, fan))
+    {
+      mqttStatus = "JSON MQTT: fan tidak dikenal";
+      mqttLastCommandResult = mqttStatus;
+      return;
+    }
+    if (mqttJsonString(command, "protocol", text))
+    {
+      const decode_type_t protocol = strToDecodeType(text.c_str());
+      if (!IRac::isProtocolSupported(protocol))
+      {
+        mqttStatus = "JSON MQTT: protocol tidak didukung";
+        mqttLastCommandResult = mqttStatus;
+        return;
+      }
+      pendingMqttProtocol = protocol;
+    }
+    else pendingMqttProtocol = decode_type_t::UNKNOWN;
+
+    mqttAcTemperature = (uint8_t)temperature;
+    mqttAcMode = mode;
+    mqttAcFan = fan;
+    pendingMqttIrRequest = MQTT_IR_SET_STATE;
+  }
+  else
+  {
+    mqttStatus = "Perintah MQTT tidak dikenal: " + command;
+    mqttLastCommandResult = mqttStatus;
+    return;
+  }
+
+  mqttLastCommand = command;
+  mqttCommandCount++;
+  mqttLastCommandResult = "Diterima, menunggu eksekusi";
+  mqttStatus = "Command diterima: " + command;
 }
 
 String buildMqttPayload()
@@ -395,8 +703,12 @@ String buildMqttPayload()
   json += "\"sn\":\"" + jsonEscape(mqttDeviceId) + "\",";
   json += "\"prefix\":\"" + jsonEscape(devicePrefix) + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"meterValid\":" + String(meterData.valid ? "true" : "false") + ",";
+  json += "\"heartbeatSec\":" + String(mqttHeartbeatIntervalMs / 1000UL) + ",";
   json += "\"totalActiveEnergy\":" + String(meterData.totalActiveEnergy, 2) + ",";
   json += "\"EnergySession\":" + String(energySessionKwh, 4) + ",";
+  json += "\"lastEnergySession\":" + String(energySessionLastKwh, 4) + ",";
+  json += "\"energySessionActive\":" + String(energySessionActive ? "true" : "false") + ",";
   json += "\"CountSession\":" + String(countSession) + ",";
   json += "\"voltage\":" + String(meterData.voltage, 1) + ",";
   json += "\"current\":" + String(meterData.current, 3) + ",";
@@ -408,6 +720,26 @@ String buildMqttPayload()
   json += "\"uptimeMs\":" + String(millis());
   json += "}";
   return json;
+}
+
+void publishMqttEvent(const char *eventName, const String &detail)
+{
+  mqttHeartbeatDue = true;
+  if (!mqttClient.connected()) return;
+  updateMqttTopics();
+  String payload = "{\"event\":\"" + jsonEscape(eventName) + "\",\"detail\":\"" +
+                   jsonEscape(detail) + "\",\"uptimeMs\":" + String(millis()) +
+                   ",\"sessionCount\":" + String(countSession) + "}";
+  if (mqttClient.publish(mqttEventTopic.c_str(), payload.c_str(), false))
+  {
+    mqttOkCount++;
+    mqttStatus = "Event MQTT: " + String(eventName);
+  }
+  else
+  {
+    mqttErrCount++;
+    mqttStatus = "Event MQTT gagal: " + String(eventName);
+  }
 }
 
 void connectMqtt()
@@ -425,7 +757,14 @@ void connectMqtt()
 
   if (mqttClient.connect(clientId.c_str()))
   {
-    mqttStatus = "MQTT connected";
+    mqttHeartbeatDue = true;
+    if (mqttClient.subscribe(mqttCommandTopic.c_str()))
+      mqttStatus = "MQTT connected + subscribed";
+    else
+    {
+      mqttStatus = "MQTT connected, subscribe gagal";
+      mqttErrCount++;
+    }
     return;
   }
 
@@ -455,9 +794,12 @@ void serviceMqtt()
 
 bool publishMeterMqtt()
 {
-  if (!meterData.valid || meterData.lastSuccessMs == 0)
+  // A zero-voltage frame is not useful telemetry and can occur briefly while
+  // the meter/RS485 line is settling. Keep the previous valid retained state
+  // at the broker, then publish again as soon as voltage is valid.
+  if (!meterData.valid || meterData.voltage <= 0.0f)
   {
-    mqttStatus = "Meter belum valid";
+    mqttStatus = "Publish ditahan: voltage 0 / meter belum valid";
     return false;
   }
 
@@ -473,7 +815,9 @@ bool publishMeterMqtt()
   const bool ok = mqttClient.publish(mqttStateTopic.c_str(), payload.c_str(), true);
   if (ok)
   {
-    lastPublishedMeterReadMs = meterData.lastSuccessMs;
+    lastPublishedMeterReadMs = millis();
+    lastMqttHeartbeatMs = millis();
+    mqttHeartbeatDue = false;
     lastMqttPayload = payload;
     mqttOkCount++;
     mqttStatus = "Publish OK";
@@ -487,6 +831,18 @@ bool publishMeterMqtt()
   return ok;
 }
 
+void serviceMqttHeartbeat()
+{
+  if (!internetReady() || !mqttClient.connected()) return;
+  const uint32_t now = millis();
+  const bool intervalElapsed = lastMqttHeartbeatMs == 0 ||
+                               now - lastMqttHeartbeatMs >= mqttHeartbeatIntervalMs;
+  if (!mqttHeartbeatDue && !intervalElapsed) return;
+  if (now - lastMqttHeartbeatAttemptMs < 1000) return;
+  lastMqttHeartbeatAttemptMs = now;
+  publishMeterMqtt();
+}
+
 void updateEnergySession()
 {
   const bool activeNow = meterData.activePower >= SESSION_ACTIVE_POWER_THRESHOLD_KW;
@@ -498,17 +854,18 @@ void updateEnergySession()
     energySessionKwh = 0.0f;
     countSession++;
     prefs.putUInt("cntSess", countSession);
+    publishMqttEvent("session_started", "Daya di atas 10 Watt");
   }
   else if (activeNow)
   {
     energySessionKwh = meterData.totalActiveEnergy - energySessionStartKwh;
     if (energySessionKwh < 0.0f) energySessionKwh = 0.0f;
   }
-  else
+  else if (energySessionActive)
   {
     energySessionActive = false;
-    energySessionStartKwh = meterData.totalActiveEnergy;
-    energySessionKwh = 0.0f;
+    energySessionLastKwh = energySessionKwh;
+    publishMqttEvent("session_stopped", "Daya di bawah 10 Watt; energi=" + String(energySessionLastKwh, 4) + " kWh");
   }
 }
 
@@ -648,9 +1005,34 @@ bool setupMicrophone()
   }
 
   microphoneReady = true;
-  microphoneStatus = "Siap - silakan bicara";
+  microphoneNoiseFloor = 20;
+  microphoneVadThreshold = MIC_VAD_MIN_START;
+  microphoneSpikeCount = 0;
+  microphoneDcEstimate = 0.0f;
+  microphoneCalibrationUntilMs = millis() + MIC_CALIBRATION_MS;
+  microphoneCalibrationActive = true;
+  microphoneStatus = "Kalibrasi noise - harap diam";
   Serial.println("[MIC] I2S siap: BCLK6 WS7 DIN15");
   return true;
+}
+
+void startMicrophoneCalibration()
+{
+  if (!microphoneReady && !setupMicrophone()) return;
+  if (voiceCaptureActive)
+  {
+    voicePcmSamples = 0;
+    voiceCaptureActive = false;
+  }
+  microphoneNoiseFloor = 1;
+  microphoneVadThreshold = MIC_VAD_MIN_START;
+  microphoneSpikeCount = 0;
+  microphoneDcEstimate = 0.0f;
+  voiceTriggerChunks = 0;
+  microphoneCalibrationUntilMs = millis() + MIC_CALIBRATION_MS;
+  microphoneCalibrationActive = true;
+  microphoneStatus = "Kalibrasi noise - harap diam";
+  microphoneTestResult = "Kalibrasi 3 detik: jangan bicara dan jangan sentuh microphone";
 }
 
 void startMicrophoneTest()
@@ -658,6 +1040,11 @@ void startMicrophoneTest()
   if (!microphoneReady && !setupMicrophone())
   {
     microphoneTestResult = microphoneStatus;
+    return;
+  }
+  if ((int32_t)(microphoneCalibrationUntilMs - millis()) > 0)
+  {
+    microphoneTestResult = "Tunggu kalibrasi noise selesai, lalu mulai uji bicara";
     return;
   }
 
@@ -677,33 +1064,79 @@ void serviceMicrophone()
   if (!microphoneReady) return;
 
   int32_t raw[MIC_CHUNK_SAMPLES];
+  int16_t conditioned[MIC_CHUNK_SAMPLES];
   size_t bytesRead = 0;
   const esp_err_t result = i2s_read(MIC_I2S_PORT, raw, sizeof(raw), &bytesRead, 0);
   const size_t samples = bytesRead / sizeof(raw[0]);
 
   if (result == ESP_OK && samples > 0)
   {
-    int64_t sum = 0;
-    uint64_t sumSquares = 0;
-    uint32_t peak = 0;
+    // High-pass sederhana menghilangkan DC offset. Isolated-spike suppressor
+    // hanya mengganti impuls yang sangat berbeda dari kedua tetangganya.
     for (size_t i = 0; i < samples; i++)
     {
-      const int32_t value = raw[i] >> 16;
+      const int32_t input = raw[i] >> 16;
+      microphoneDcEstimate += ((float)input - microphoneDcEstimate) * (1.0f / 1024.0f);
+      int32_t value = input - (int32_t)microphoneDcEstimate;
+      if (value > INT16_MAX) value = INT16_MAX;
+      if (value < INT16_MIN) value = INT16_MIN;
+      conditioned[i] = (int16_t)value;
+    }
+
+    int32_t spikeLimit = (int32_t)microphoneNoiseFloor * 12;
+    if (spikeLimit < 500) spikeLimit = 500;
+    for (size_t i = 1; i + 1 < samples; i++)
+    {
+      const int32_t neighborAverage = ((int32_t)conditioned[i - 1] + conditioned[i + 1]) / 2;
+      const int32_t neighborDifference = abs((int32_t)conditioned[i - 1] - conditioned[i + 1]);
+      const int32_t deviation = abs((int32_t)conditioned[i] - neighborAverage);
+      if (deviation > spikeLimit && neighborDifference < spikeLimit / 3)
+      {
+        conditioned[i] = (int16_t)neighborAverage;
+        microphoneSpikeCount++;
+      }
+    }
+
+    uint64_t sumSquares = 0;
+    uint32_t peak = 0;
+    int32_t rmsClip = (int32_t)microphoneNoiseFloor * 10;
+    if (rmsClip < 240) rmsClip = 240;
+    for (size_t i = 0; i < samples; i++)
+    {
+      const int32_t value = conditioned[i];
       const uint32_t magnitude = value < 0 ? (uint32_t)-value : (uint32_t)value;
-      sum += value;
-      sumSquares += (int64_t)value * value;
+      const uint32_t limited = magnitude < (uint32_t)rmsClip ? magnitude : (uint32_t)rmsClip;
+      sumSquares += (uint64_t)limited * limited;
       if (magnitude > peak) peak = magnitude;
     }
 
-    const double mean = (double)sum / samples;
-    double variance = ((double)sumSquares / samples) - (mean * mean);
-    if (variance < 0) variance = 0;
-    microphoneRms = (uint32_t)sqrt(variance);
+    const uint32_t instantRms = (uint32_t)sqrt((double)sumSquares / samples);
+    microphoneRms = microphoneRms == 0 ? instantRms : (microphoneRms * 3 + instantRms) / 4;
     microphonePeak = peak;
     microphoneChunks++;
-    if (microphoneRms > microphoneTestMaxRms) microphoneTestMaxRms = microphoneRms;
+
+    const bool calibrating = (int32_t)(microphoneCalibrationUntilMs - millis()) > 0;
+    if (calibrating)
+      microphoneNoiseFloor = microphoneNoiseFloor <= 1 ? instantRms : (microphoneNoiseFloor * 7 + instantRms) / 8;
+    else if (!voiceCaptureActive && instantRms < microphoneVadThreshold)
+      microphoneNoiseFloor = (microphoneNoiseFloor * 199 + instantRms) / 200;
+
+    if (microphoneNoiseFloor < 1) microphoneNoiseFloor = 1;
+    microphoneVadThreshold = microphoneNoiseFloor * 3 + 20;
+    if (microphoneVadThreshold < MIC_VAD_MIN_START) microphoneVadThreshold = MIC_VAD_MIN_START;
+
+    if (instantRms > microphoneTestMaxRms) microphoneTestMaxRms = instantRms;
     if (microphonePeak > microphoneTestMaxPeak) microphoneTestMaxPeak = microphonePeak;
-    microphoneStatus = microphoneRms > MIC_SPEECH_RMS_THRESHOLD ? "Suara terdeteksi" : "Siap - menunggu suara";
+    microphoneStatus = calibrating
+      ? "Kalibrasi noise - harap diam"
+      : (instantRms >= microphoneVadThreshold ? "Suara terdeteksi" : "Siap - noise terkondisi");
+    if (!calibrating && microphoneCalibrationActive)
+    {
+      microphoneCalibrationActive = false;
+      microphoneTestResult = "Kalibrasi selesai - noise " + String(microphoneNoiseFloor) +
+                             ", ambang bicara " + String(microphoneVadThreshold);
+    }
+    serviceVoiceCapture(conditioned, samples, instantRms);
   }
   else if (result != ESP_OK && result != ESP_ERR_TIMEOUT)
   {
@@ -714,7 +1147,7 @@ void serviceMicrophone()
   if (microphoneTestRunning && millis() - microphoneTestStartedMs >= MIC_TEST_DURATION_MS)
   {
     microphoneTestRunning = false;
-    const bool ok = microphoneChunks > 5 && microphoneTestMaxRms >= MIC_SPEECH_RMS_THRESHOLD;
+    const bool ok = microphoneChunks > 5 && microphoneTestMaxRms >= microphoneVadThreshold;
     microphoneTestResult = ok
       ? "OK - suara bicara terdeteksi"
       : "GAGAL - tidak ada suara, cek L/R=GND dan kabel";
@@ -724,6 +1157,210 @@ void serviceMicrophone()
                  "Peak " + String(microphoneTestMaxPeak),
                  ok ? "Suara terdeteksi" : "Cek koneksi mic");
   }
+}
+
+String extractWitTranscript(const String &response)
+{
+  String best;
+  best.reserve(128);
+  int searchFrom = 0;
+  while (true)
+  {
+    const int key = response.indexOf("\"text\"", searchFrom);
+    if (key < 0) break;
+    const int colon = response.indexOf(':', key);
+    const int quote = colon >= 0 ? response.indexOf('"', colon + 1) : -1;
+    if (quote < 0) break;
+
+    String candidate;
+    candidate.reserve(128);
+    bool escaped = false;
+    int end = quote + 1;
+    for (; end < (int)response.length(); end++)
+    {
+      const char c = response[end];
+      if (escaped)
+      {
+        if (c == 'n' || c == 'r' || c == 't') candidate += ' ';
+        else candidate += c;
+        escaped = false;
+      }
+      else if (c == '\\') escaped = true;
+      else if (c == '"') break;
+      else candidate += c;
+    }
+    candidate.trim();
+    if (candidate.length() > best.length()) best = candidate;
+    searchFrom = end + 1;
+  }
+  return best;
+}
+
+void voiceUploadTask(void *parameter)
+{
+  VoiceUploadJob *job = static_cast<VoiceUploadJob *>(parameter);
+  VoiceRecognitionResult result = {};
+  result.httpCode = -1;
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+
+  if (http.begin(secureClient, WIT_SPEECH_URL))
+  {
+    http.addHeader("Authorization", "Bearer " + String(WITAI_SERVER_TOKEN));
+    http.addHeader("Content-Type", "audio/raw;encoding=signed-integer;bits=16;rate=8000;endian=little");
+    result.httpCode = http.POST(reinterpret_cast<uint8_t *>(job->pcm), job->samples * sizeof(int16_t));
+    if (result.httpCode > 0)
+    {
+      const String response = http.getString();
+      const String transcript = extractWitTranscript(response);
+      transcript.substring(0, sizeof(result.transcript) - 1).toCharArray(result.transcript, sizeof(result.transcript));
+      if (transcript.length() == 0)
+        snprintf(result.error, sizeof(result.error), "Respons STT tanpa teks");
+    }
+    else
+    {
+      snprintf(result.error, sizeof(result.error), "HTTP gagal: %s", http.errorToString(result.httpCode).c_str());
+    }
+    http.end();
+  }
+  else
+  {
+    snprintf(result.error, sizeof(result.error), "Tidak dapat membuka koneksi Wit.ai");
+  }
+
+  if (voiceResultQueue) xQueueSend(voiceResultQueue, &result, pdMS_TO_TICKS(100));
+  voicePcmSamples = 0;
+  voiceSttBusy = false;
+  vTaskDelete(nullptr);
+}
+
+void finishVoiceCapture()
+{
+  if (!voiceCaptureActive) return;
+  voiceCaptureActive = false;
+  const uint32_t durationMs = (voicePcmSamples * 1000UL) / VOICE_STT_SAMPLE_RATE;
+
+  if (durationMs < VOICE_MIN_RECORD_MS || !internetReady() || voiceSttBusy)
+  {
+    voicePcmSamples = 0;
+    if (!internetReady()) voiceAssistantStatus = "Menunggu internet untuk speech-to-text";
+    return;
+  }
+
+  voiceUploadJob.pcm = voicePcmStorage;
+  voiceUploadJob.samples = voicePcmSamples;
+  voiceSttBusy = true;
+  voiceAssistantStatus = "Mengenali ucapan...";
+  if (xTaskCreate(voiceUploadTask, "wit-stt", 8192, &voiceUploadJob, 1, nullptr) != pdPASS)
+  {
+    voicePcmSamples = 0;
+    voiceSttBusy = false;
+    voiceRecognitionErrors++;
+    voiceAssistantStatus = "Gagal membuat task speech-to-text";
+  }
+}
+
+void serviceVoiceCapture(const int16_t *pcm, size_t samples, uint32_t rms)
+{
+  const bool calibrating = (int32_t)(microphoneCalibrationUntilMs - millis()) > 0;
+  if (!voiceAssistantEnabled || calibrating || microphoneTestRunning || remoteSetupStep != 0 || voiceSttBusy || millis() < voiceIgnoreUntilMs)
+  {
+    voiceTriggerChunks = 0;
+    voiceTriggerStartedMs = 0;
+    voiceTriggerMinRms = UINT32_MAX;
+    voiceTriggerMaxRms = 0;
+    voicePreRollCount = 0;
+    return;
+  }
+
+  uint32_t continueThreshold = microphoneNoiseFloor * 2 + 10;
+  if (continueThreshold < MIC_VAD_MIN_CONTINUE) continueThreshold = MIC_VAD_MIN_CONTINUE;
+  const bool sound = rms >= (voiceCaptureActive ? continueThreshold : microphoneVadThreshold);
+  bool startedNow = false;
+
+  if (!voiceCaptureActive)
+  {
+    if (!internetReady()) return;
+
+    // Simpan audio sebelum trigger agar awal kata tidak terpotong ketika VAD
+    // menunggu cukup lama untuk menolak bunyi bip pendek.
+    for (size_t i = 0; i < samples; i += 2)
+    {
+      voicePreRoll[voicePreRollWrite] = pcm[i];
+      voicePreRollWrite = (voicePreRollWrite + 1) % VOICE_PREROLL_SAMPLES;
+      if (voicePreRollCount < VOICE_PREROLL_SAMPLES) voicePreRollCount++;
+    }
+
+    if (!sound)
+    {
+      voiceTriggerChunks = 0;
+      voiceTriggerStartedMs = 0;
+      voiceTriggerMinRms = UINT32_MAX;
+      voiceTriggerMaxRms = 0;
+      return;
+    }
+
+    if (voiceTriggerStartedMs == 0)
+    {
+      voiceTriggerStartedMs = millis();
+      voiceTriggerMinRms = UINT32_MAX;
+      voiceTriggerMaxRms = 0;
+    }
+    if (voiceTriggerChunks < UINT8_MAX) voiceTriggerChunks++;
+
+    const uint32_t triggerAge = millis() - voiceTriggerStartedMs;
+    // Abaikan ramp naik awal sebuah beep; ukur perubahan level setelah nada
+    // sempat stabil. Pada ucapan, envelope tetap berubah karena suku kata.
+    if (triggerAge >= VOICE_TRIGGER_SETTLE_MS)
+    {
+      if (rms < voiceTriggerMinRms) voiceTriggerMinRms = rms;
+      if (rms > voiceTriggerMaxRms) voiceTriggerMaxRms = rms;
+    }
+    if (triggerAge < VOICE_TRIGGER_HOLD_MS) return;
+
+    // Bip mesin biasanya pendek atau memiliki level nyaris tetap. Ucapan
+    // memiliki envelope yang berubah sepanjang suku kata.
+    uint32_t requiredModulation = microphoneNoiseFloor;
+    if (requiredModulation < 20) requiredModulation = 20;
+    const bool speechEnvelope = voiceTriggerMinRms != UINT32_MAX &&
+                                voiceTriggerMaxRms - voiceTriggerMinRms >= requiredModulation;
+    if (!speechEnvelope)
+    {
+      if (triggerAge >= VOICE_TRIGGER_REJECT_MS)
+      {
+        voiceAssistantStatus = "Bunyi bip/konstan diabaikan";
+        voiceTriggerStartedMs = 0;
+        voiceTriggerMinRms = UINT32_MAX;
+        voiceTriggerMaxRms = 0;
+        voiceTriggerChunks = 0;
+        voicePreRollCount = 0;
+      }
+      return;
+    }
+
+    voicePcmSamples = 0;
+    const size_t oldest = (voicePreRollWrite + VOICE_PREROLL_SAMPLES - voicePreRollCount) % VOICE_PREROLL_SAMPLES;
+    for (size_t i = 0; i < voicePreRollCount && voicePcmSamples < VOICE_MAX_SAMPLES; i++)
+      voicePcm[voicePcmSamples++] = voicePreRoll[(oldest + i) % VOICE_PREROLL_SAMPLES];
+    voicePreRollCount = 0;
+    voiceCaptureStartedMs = millis();
+    voiceLastSoundMs = millis();
+    voiceCaptureActive = true;
+    startedNow = true;
+    voiceAssistantStatus = "Mendengarkan...";
+  }
+
+  if (!startedNow)
+    for (size_t i = 0; i < samples && voicePcmSamples < VOICE_MAX_SAMPLES; i += 2)
+      voicePcm[voicePcmSamples++] = pcm[i];
+
+  if (sound) voiceLastSoundMs = millis();
+  const bool full = voicePcmSamples >= VOICE_MAX_SAMPLES;
+  const bool silent = millis() - voiceLastSoundMs >= VOICE_SILENCE_STOP_MS;
+  if (full || silent) finishVoiceCapture();
 }
 
 bool setupAmplifier()
@@ -841,6 +1478,288 @@ bool playAmplifierTone(float startFrequency, float endFrequency, uint16_t durati
 
   i2s_zero_dma_buffer(AMP_I2S_PORT);
   return true;
+}
+
+struct VoiceClip
+{
+  const uint8_t *data;
+  size_t length;
+};
+
+#define VOICE_CLIP(name) VoiceClip{VOICE_##name, VOICE_##name##_LEN}
+
+VoiceClip numberClip(uint8_t value)
+{
+  switch (value)
+  {
+    case 0: return VOICE_CLIP(NOL); case 1: return VOICE_CLIP(SATU);
+    case 2: return VOICE_CLIP(DUA); case 3: return VOICE_CLIP(TIGA);
+    case 4: return VOICE_CLIP(EMPAT); case 5: return VOICE_CLIP(LIMA);
+    case 6: return VOICE_CLIP(ENAM); case 7: return VOICE_CLIP(TUJUH);
+    case 8: return VOICE_CLIP(DELAPAN); case 9: return VOICE_CLIP(SEMBILAN);
+    case 10: return VOICE_CLIP(SEPULUH); case 11: return VOICE_CLIP(SEBELAS);
+    case 12: return VOICE_CLIP(DUA_BELAS); case 13: return VOICE_CLIP(TIGA_BELAS);
+    case 14: return VOICE_CLIP(EMPAT_BELAS); case 15: return VOICE_CLIP(LIMA_BELAS);
+    case 16: return VOICE_CLIP(ENAM_BELAS); case 17: return VOICE_CLIP(TUJUH_BELAS);
+    case 18: return VOICE_CLIP(DELAPAN_BELAS); default: return VOICE_CLIP(SEMBILAN_BELAS);
+  }
+}
+
+void appendClip(VoiceClip *clips, uint8_t &count, uint8_t capacity, VoiceClip clip)
+{
+  if (count < capacity) clips[count++] = clip;
+}
+
+void appendWholeNumber(VoiceClip *clips, uint8_t &count, uint8_t capacity, int32_t value)
+{
+  if (value < 0)
+  {
+    appendClip(clips, count, capacity, VOICE_CLIP(MINUS));
+    value = -value;
+  }
+  if (value < 20)
+  {
+    appendClip(clips, count, capacity, numberClip((uint8_t)value));
+    return;
+  }
+  if (value < 100)
+  {
+    appendClip(clips, count, capacity, numberClip(value / 10));
+    appendClip(clips, count, capacity, VOICE_CLIP(PULUH));
+    if (value % 10) appendWholeNumber(clips, count, capacity, value % 10);
+    return;
+  }
+  if (value < 1000)
+  {
+    if (value < 200) appendClip(clips, count, capacity, VOICE_CLIP(SERATUS));
+    else
+    {
+      appendWholeNumber(clips, count, capacity, value / 100);
+      appendClip(clips, count, capacity, VOICE_CLIP(RATUS));
+    }
+    if (value % 100) appendWholeNumber(clips, count, capacity, value % 100);
+    return;
+  }
+  if (value < 2000) appendClip(clips, count, capacity, VOICE_CLIP(SERIBU));
+  else
+  {
+    appendWholeNumber(clips, count, capacity, value / 1000);
+    appendClip(clips, count, capacity, VOICE_CLIP(RIBU));
+  }
+  if (value % 1000) appendWholeNumber(clips, count, capacity, value % 1000);
+}
+
+void appendDecimalNumber(VoiceClip *clips, uint8_t &count, uint8_t capacity, float value, uint8_t decimals)
+{
+  const float multiplier = decimals == 2 ? 100.0f : (decimals == 1 ? 10.0f : 1.0f);
+  int32_t scaled = (int32_t)lroundf(value * multiplier);
+  if (scaled < 0)
+  {
+    appendClip(clips, count, capacity, VOICE_CLIP(MINUS));
+    scaled = -scaled;
+  }
+  appendWholeNumber(clips, count, capacity, scaled / (int32_t)multiplier);
+  if (decimals == 0) return;
+  appendClip(clips, count, capacity, VOICE_CLIP(KOMA));
+  int32_t fraction = scaled % (int32_t)multiplier;
+  if (decimals == 2) appendClip(clips, count, capacity, numberClip(fraction / 10));
+  appendClip(clips, count, capacity, numberClip(fraction % 10));
+}
+
+bool playVoiceClips(const VoiceClip *clips, uint8_t count)
+{
+  if (!setupAmplifier() || count == 0) return false;
+  if (voiceCaptureActive)
+  {
+    voicePcmSamples = 0;
+    voiceCaptureActive = false;
+  }
+  voiceIgnoreUntilMs = millis() + VOICE_SPEAKER_GUARD_MS;
+  if (i2s_set_clk(AMP_I2S_PORT, 11025, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO) != ESP_OK)
+  {
+    amplifierMessage = "Gagal set sample rate suara";
+    return false;
+  }
+
+  int16_t chunk[AMP_CHUNK_FRAMES * 2];
+  bool ok = true;
+  for (uint8_t clipIndex = 0; clipIndex < count && ok; clipIndex++)
+  {
+    size_t offset = 0;
+    while (offset < clips[clipIndex].length)
+    {
+      const uint16_t frames = min((size_t)AMP_CHUNK_FRAMES, clips[clipIndex].length - offset);
+      for (uint16_t i = 0; i < frames; i++)
+      {
+        const int16_t sample = ((int16_t)pgm_read_byte(clips[clipIndex].data + offset + i) - 128) << 8;
+        chunk[i * 2] = sample;
+        chunk[(i * 2) + 1] = sample;
+      }
+      ok = writeAmplifierChunk(chunk, frames);
+      offset += frames;
+      yield();
+    }
+  }
+
+  i2s_zero_dma_buffer(AMP_I2S_PORT);
+  i2s_set_clk(AMP_I2S_PORT, AMP_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  i2s_zero_dma_buffer(MIC_I2S_PORT);
+  voiceIgnoreUntilMs = millis() + VOICE_SPEAKER_GUARD_MS;
+  return ok;
+}
+
+bool speakPrompt(VoiceClip clip)
+{
+  return playVoiceClips(&clip, 1);
+}
+
+bool speakMeasurement(VoiceClip prefix, float value, uint8_t decimals, VoiceClip unit)
+{
+  VoiceClip clips[24];
+  uint8_t count = 0;
+  appendClip(clips, count, 24, prefix);
+  appendDecimalNumber(clips, count, 24, value, decimals);
+  appendClip(clips, count, 24, unit);
+  return playVoiceClips(clips, count);
+}
+
+bool getWibTime(tm &local)
+{
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;
+  localtime_r(&now, &local);
+  return true;
+}
+
+bool isDemandResponseHour(uint8_t hour)
+{
+  if (demandResponseStartHour == demandResponseEndHour) return true;
+  if (demandResponseStartHour < demandResponseEndHour)
+    return hour >= demandResponseStartHour && hour < demandResponseEndHour;
+  return hour >= demandResponseStartHour || hour < demandResponseEndHour;
+}
+
+void serviceDemandResponse()
+{
+  if (!demandResponseEnabled)
+  {
+    demandResponseActive = false;
+    demandResponseTimeInitialized = false;
+    demandResponseStatus = "Tidak diset";
+    return;
+  }
+
+  tm local = {};
+  if (!getWibTime(local))
+  {
+    demandResponseStatus = "Menunggu sinkronisasi waktu NTP";
+    return;
+  }
+
+  const bool activeNow = isDemandResponseHour(local.tm_hour);
+  demandResponseStatus = activeNow
+    ? "Aktif (prioritas AC)"
+    : "Menunggu jadwal diskon";
+  if (!demandResponseTimeInitialized)
+  {
+    demandResponseActive = activeNow;
+    demandResponseTimeInitialized = true;
+    return;
+  }
+  if (activeNow == demandResponseActive) return;
+
+  demandResponseActive = activeNow;
+  if (activeNow)
+  {
+    pendingSystemAnnouncements |= ANNOUNCE_DISCOUNT_STARTED;
+    publishMqttEvent("demand_response_started", "Waktu diskon dimulai");
+  }
+  else
+  {
+    pendingSystemAnnouncements |= ANNOUNCE_DISCOUNT_ENDED;
+    publishMqttEvent("demand_response_ended", "Waktu diskon selesai");
+  }
+}
+
+void checkElectricalAlarms()
+{
+  if (!meterData.valid) return;
+  const bool underVoltage = alarmVoltageMin > 0 && meterData.voltage < alarmVoltageMin;
+  const bool overVoltage = alarmVoltageMax > 0 && meterData.voltage > alarmVoltageMax;
+  const bool overPower = alarmPowerMaxKw > 0 && meterData.activePower > alarmPowerMaxKw;
+
+  if (underVoltage && !alarmUnderVoltageActive)
+  {
+    pendingSystemAnnouncements |= ANNOUNCE_UNDER_VOLTAGE;
+    publishMqttEvent("under_voltage", String(meterData.voltage, 1) + " V");
+  }
+  if (overVoltage && !alarmOverVoltageActive)
+  {
+    pendingSystemAnnouncements |= ANNOUNCE_OVER_VOLTAGE;
+    publishMqttEvent("over_voltage", String(meterData.voltage, 1) + " V");
+  }
+  if (overPower && !alarmOverPowerActive)
+  {
+    pendingSystemAnnouncements |= ANNOUNCE_OVER_POWER;
+    publishMqttEvent("over_power", String(meterData.activePower * 1000.0f, 0) + " W");
+  }
+  alarmUnderVoltageActive = underVoltage;
+  alarmOverVoltageActive = overVoltage;
+  alarmOverPowerActive = overPower;
+
+  electricalAlarmStatus = "Normal";
+  if (underVoltage) electricalAlarmStatus = "Warning: Under Voltage";
+  else if (overVoltage) electricalAlarmStatus = "Warning: Over Voltage";
+  else if (overPower) electricalAlarmStatus = "Warning: Over Power";
+}
+
+void serviceSystemAnnouncements()
+{
+  if (pendingSystemAnnouncements == ANNOUNCE_NONE) return;
+  const uint8_t announcement = pendingSystemAnnouncements & (uint8_t)(-(int8_t)pendingSystemAnnouncements);
+  pendingSystemAnnouncements &= ~announcement;
+
+  // Distinct tone patterns keep alarm handling fully offline and do not
+  // depend on the cloud voice-recognition path.
+  voiceIgnoreUntilMs = millis() + VOICE_SPEAKER_GUARD_MS;
+  if (announcement == ANNOUNCE_DISCOUNT_STARTED)
+    playAmplifierTone(700.0f, 1300.0f, 420, 35);
+  else if (announcement == ANNOUNCE_DISCOUNT_ENDED)
+    playAmplifierTone(1300.0f, 700.0f, 420, 35);
+  else if (announcement == ANNOUNCE_UNDER_VOLTAGE)
+    playAmplifierTone(420.0f, 420.0f, 520, 45);
+  else if (announcement == ANNOUNCE_OVER_VOLTAGE)
+    playAmplifierTone(1450.0f, 1450.0f, 520, 45);
+  else if (announcement == ANNOUNCE_OVER_POWER)
+    playAmplifierTone(900.0f, 900.0f, 520, 45);
+  voiceIgnoreUntilMs = millis() + VOICE_SPEAKER_GUARD_MS;
+}
+
+void serviceMqttVoiceRequest()
+{
+  if (pendingMqttVoiceRequest == MQTT_VOICE_NONE) return;
+  const MqttVoiceRequest request = pendingMqttVoiceRequest;
+  pendingMqttVoiceRequest = MQTT_VOICE_NONE;
+
+  if (!meterData.valid)
+  {
+    speakPrompt(VOICE_CLIP(METER_TIDAK_TERSEDIA));
+    mqttStatus = "Request suara gagal: meter belum tersedia";
+    return;
+  }
+
+  bool ok = false;
+  if (request == MQTT_VOICE_VOLTAGE)
+    ok = speakMeasurement(VOICE_CLIP(TEGANGAN), meterData.voltage, 1, VOICE_CLIP(VOLT));
+  else if (request == MQTT_VOICE_CURRENT)
+    ok = speakMeasurement(VOICE_CLIP(ARUS), meterData.current, 2, VOICE_CLIP(AMPERE));
+  else if (request == MQTT_VOICE_POWER)
+    ok = speakMeasurement(VOICE_CLIP(DAYA), meterData.activePower * 1000.0f, 0, VOICE_CLIP(WATT));
+
+  mqttStatus = ok
+    ? "Request suara selesai: " + mqttLastCommand
+    : "Request suara gagal diputar: " + mqttLastCommand;
+  mqttLastCommandResult = mqttStatus;
 }
 
 bool playVoiceSample()
@@ -987,7 +1906,40 @@ String irLearnLabel()
 {
   if (irLearnSlot == IR_LEARN_ON) return "LEARN ON";
   if (irLearnSlot == IR_LEARN_OFF) return "LEARN OFF";
+  if (irLearnSlot == IR_LEARN_TEMPERATURE) return "LEARN " + String(irLearnTemperature) + " C";
   return "IDLE";
+}
+
+bool isValidIrTemperature(uint8_t temperature)
+{
+  return temperature >= IR_TEMP_MIN_C && temperature <= IR_TEMP_MAX_C;
+}
+
+uint8_t irTemperatureIndex(uint8_t temperature)
+{
+  return temperature - IR_TEMP_MIN_C;
+}
+
+String irTemperatureLenKey(uint8_t temperature)
+{
+  return "t" + String(temperature) + "Len";
+}
+
+String irTemperatureRawKey(uint8_t temperature)
+{
+  return "t" + String(temperature) + "Raw";
+}
+
+String learnedTemperatureList()
+{
+  String values;
+  for (uint8_t temperature = IR_TEMP_MIN_C; temperature <= IR_TEMP_MAX_C; temperature++)
+  {
+    if (rawIrTemperatureLen[irTemperatureIndex(temperature)] == 0) continue;
+    if (values.length() > 0) values += ", ";
+    values += String(temperature) + " C";
+  }
+  return values.length() > 0 ? values : "Belum ada";
 }
 
 void loadIrStorage()
@@ -996,30 +1948,88 @@ void loadIrStorage()
   devicePrefix = normalizePrefix(prefs.getString("prefix", DEFAULT_DEVICE_PREFIX));
   wifiStaSsid = prefs.getString("staSsid", "");
   wifiStaPassword = prefs.getString("staPass", "");
+  uint32_t heartbeatSec = prefs.getUInt("mqttHbSec", MQTT_HEARTBEAT_DEFAULT_SEC);
+  if (heartbeatSec < MQTT_HEARTBEAT_MIN_SEC || heartbeatSec > MQTT_HEARTBEAT_MAX_SEC)
+    heartbeatSec = MQTT_HEARTBEAT_DEFAULT_SEC;
+  mqttHeartbeatIntervalMs = heartbeatSec * 1000UL;
   countSession = prefs.getUInt("cntSess", 0);
+  demandResponseEnabled = prefs.getBool("drEnabled", false);
+  demandResponseStartHour = prefs.getUChar("drStart", 0);
+  demandResponseEndHour = prefs.getUChar("drEnd", 0);
+  if (demandResponseStartHour > DEMAND_RESPONSE_HOUR_MAX) demandResponseStartHour = 0;
+  if (demandResponseEndHour > DEMAND_RESPONSE_HOUR_MAX) demandResponseEndHour = 0;
+  alarmVoltageMin = prefs.getFloat("alarmVMin", 0.0f);
+  alarmVoltageMax = prefs.getFloat("alarmVMax", 0.0f);
+  alarmPowerMaxKw = prefs.getFloat("alarmPMax", 0.0f);
+  if (alarmVoltageMin < 0) alarmVoltageMin = 0;
+  if (alarmVoltageMax < 0) alarmVoltageMax = 0;
+  if (alarmPowerMaxKw < 0) alarmPowerMaxKw = 0;
+  acProtocol = (decode_type_t)prefs.getShort("acProto", (int16_t)decode_type_t::UNKNOWN);
+  if (!IRac::isProtocolSupported(acProtocol)) acProtocol = decode_type_t::UNKNOWN;
   loadIrRaw("onLen", "onRaw", rawIrOn, rawIrOnLen);
   loadIrRaw("offLen", "offRaw", rawIrOff, rawIrOffLen);
+  for (uint8_t temperature = IR_TEMP_MIN_C; temperature <= IR_TEMP_MAX_C; temperature++)
+  {
+    rawIrTemperatureLen[irTemperatureIndex(temperature)] =
+      prefs.getUShort(irTemperatureLenKey(temperature).c_str(), 0);
+    if (rawIrTemperatureLen[irTemperatureIndex(temperature)] > IR_MAX_RAW_LEN)
+      rawIrTemperatureLen[irTemperatureIndex(temperature)] = 0;
+  }
   irStatus = "IR siap";
-  irMessage = "Loaded ON " + String(rawIrOnLen) + ", OFF " + String(rawIrOffLen);
+  irMessage = "Loaded ON " + String(rawIrOnLen) + ", OFF " + String(rawIrOffLen) +
+              ", suhu " + learnedTemperatureList();
 }
 
 void saveDevicePrefix(const String &prefix)
 {
   devicePrefix = normalizePrefix(prefix);
   prefs.putString("prefix", devicePrefix);
+  if (mqttClient.connected()) mqttClient.disconnect();
   updateMqttTopics();
+  lastMqttConnectAttemptMs = 0;
+}
+
+void saveDemandResponseConfig(bool enabled, uint8_t startHour, uint8_t endHour)
+{
+  demandResponseEnabled = enabled;
+  demandResponseStartHour = startHour;
+  demandResponseEndHour = endHour;
+  demandResponseTimeInitialized = false;
+  prefs.putBool("drEnabled", demandResponseEnabled);
+  prefs.putUChar("drStart", demandResponseStartHour);
+  prefs.putUChar("drEnd", demandResponseEndHour);
+  mqttHeartbeatDue = true;
+}
+
+void saveAlarmConfig(float voltageMin, float voltageMax, float powerMaxWatt)
+{
+  alarmVoltageMin = max(0.0f, voltageMin);
+  alarmVoltageMax = max(0.0f, voltageMax);
+  alarmPowerMaxKw = max(0.0f, powerMaxWatt) / 1000.0f;
+  alarmUnderVoltageActive = false;
+  alarmOverVoltageActive = false;
+  alarmOverPowerActive = false;
+  electricalAlarmStatus = "Alarm disimpan - menunggu pembacaan meter";
+  prefs.putFloat("alarmVMin", alarmVoltageMin);
+  prefs.putFloat("alarmVMax", alarmVoltageMax);
+  prefs.putFloat("alarmPMax", alarmPowerMaxKw);
+  mqttHeartbeatDue = true;
 }
 
 void startIrLearn(IrLearnSlot slot)
 {
   irLearnSlot = slot;
-  irMessage = slot == IR_LEARN_ON
-    ? "Arahkan remote lalu tekan tombol ON sekali"
-    : "Arahkan remote lalu tekan tombol OFF sekali";
+  if (slot == IR_LEARN_ON)
+    irMessage = "Arahkan remote lalu tekan tombol ON sekali";
+  else if (slot == IR_LEARN_OFF)
+    irMessage = "Arahkan remote lalu tekan tombol OFF sekali";
+  else
+    irMessage = "Atur remote ke " + String(irLearnTemperature) + " C, lalu tekan tombol suhu sekali";
   irStatus = irLearnLabel();
   setIrReceiverActive(true);
   setLed(80, 45, 0);
-  drawOledText("IR " + irStatus, "RX GPIO4", "Tekan remote asli", slot == IR_LEARN_ON ? "Belajar ON" : "Belajar OFF");
+  drawOledText("IR " + irStatus, "RX GPIO4", "Tekan remote asli",
+               slot == IR_LEARN_TEMPERATURE ? "Belajar suhu" : (slot == IR_LEARN_ON ? "Belajar ON" : "Belajar OFF"));
 }
 
 bool captureIrSignal()
@@ -1059,6 +2069,7 @@ bool captureIrSignal()
     return false;
   }
 
+  const IrLearnSlot completedSlot = irLearnSlot;
   if (irLearnSlot == IR_LEARN_ON)
   {
     memcpy(rawIrOn, raw, correctedLength * sizeof(uint16_t));
@@ -1066,12 +2077,40 @@ bool captureIrSignal()
     saveIrRaw("onLen", "onRaw", rawIrOn, rawIrOnLen);
     irMessage = "Berhasil simpan IR ON, len " + String(rawIrOnLen);
   }
-  else
+  else if (irLearnSlot == IR_LEARN_OFF)
   {
     memcpy(rawIrOff, raw, correctedLength * sizeof(uint16_t));
     rawIrOffLen = correctedLength;
     saveIrRaw("offLen", "offRaw", rawIrOff, rawIrOffLen);
     irMessage = "Berhasil simpan IR OFF, len " + String(rawIrOffLen);
+  }
+  else
+  {
+    const uint8_t temperature = irLearnTemperature;
+    const uint8_t index = irTemperatureIndex(temperature);
+    const String lenKey = irTemperatureLenKey(temperature);
+    const String rawKey = irTemperatureRawKey(temperature);
+    const size_t saved = prefs.putBytes(rawKey.c_str(), raw, correctedLength * sizeof(uint16_t));
+    if (saved == correctedLength * sizeof(uint16_t))
+    {
+      prefs.putUShort(lenKey.c_str(), correctedLength);
+      rawIrTemperatureLen[index] = correctedLength;
+      irMessage = "Berhasil simpan IR suhu " + String(temperature) + " C, len " + String(correctedLength);
+    }
+    else
+    {
+      prefs.remove(lenKey.c_str());
+      prefs.remove(rawKey.c_str());
+      rawIrTemperatureLen[index] = 0;
+      irMessage = "Gagal simpan IR suhu: NVS penuh";
+    }
+  }
+
+  if (IRac::isProtocolSupported(irResults.decode_type))
+  {
+    acProtocol = irResults.decode_type;
+    prefs.putShort("acProto", (int16_t)acProtocol);
+    irMessage += " / protocol " + typeToString(acProtocol);
   }
 
   delete[] raw;
@@ -1080,7 +2119,19 @@ bool captureIrSignal()
   setIrReceiverActive(false);
   irStatus = "IR siap";
   setLed(0, 60, 0);
-  drawOledText("IR tersimpan", "ON " + String(rawIrOnLen), "OFF " + String(rawIrOffLen), "Siap test kirim");
+  drawOledText("IR tersimpan", "ON " + String(rawIrOnLen), "OFF " + String(rawIrOffLen), "Suhu " + learnedTemperatureList());
+
+  if (remoteSetupStep == 1 && completedSlot == IR_LEARN_ON)
+  {
+    remoteSetupStep = 2;
+    speakPrompt(VOICE_CLIP(TEKAN_OFF_REMOTE));
+    startIrLearn(IR_LEARN_OFF);
+  }
+  else if (remoteSetupStep == 2 && completedSlot == IR_LEARN_OFF)
+  {
+    remoteSetupStep = 0;
+    speakPrompt(VOICE_CLIP(REMOTE_TERSIMPAN));
+  }
   return true;
 }
 
@@ -1117,18 +2168,306 @@ bool sendIrRaw(const String &slot)
   return true;
 }
 
+bool sendIrLearnedTemperature(uint8_t temperature)
+{
+  if (!isValidIrTemperature(temperature)) return false;
+  const uint16_t length = rawIrTemperatureLen[irTemperatureIndex(temperature)];
+  if (length == 0)
+  {
+    irMessage = "IR suhu " + String(temperature) + " C belum direkam";
+    return false;
+  }
+
+  const String lenKey = irTemperatureLenKey(temperature);
+  const String rawKey = irTemperatureRawKey(temperature);
+  const size_t expectedBytes = length * sizeof(uint16_t);
+  if (prefs.getBytesLength(rawKey.c_str()) != expectedBytes ||
+      prefs.getBytes(rawKey.c_str(), rawIrTemperature, expectedBytes) != expectedBytes)
+  {
+    rawIrTemperatureLen[irTemperatureIndex(temperature)] = 0;
+    prefs.remove(lenKey.c_str());
+    irMessage = "Rekaman IR suhu " + String(temperature) + " C tidak valid";
+    return false;
+  }
+
+  setIrReceiverActive(false);
+  setLed(0, 0, 80);
+  irSender.sendRaw(rawIrTemperature, length, IR_SEND_KHZ);
+  irStatus = "IR sent";
+  irMessage = "Kirim IR suhu " + String(temperature) + " C, len " + String(length);
+  drawOledText("Kirim suhu " + String(temperature) + " C", "TX GPIO10", "Len " + String(length), "38 kHz raw");
+  delay(120);
+  setLed(0, 25, 0);
+  return true;
+}
+
+bool sendAcState(bool power, uint8_t temperature, stdAc::opmode_t mode, stdAc::fanspeed_t fan)
+{
+  if (temperature < 16 || temperature > 30)
+  {
+    irMessage = "Suhu harus 16 sampai 30 derajat";
+    return false;
+  }
+  // Hasil learn suhu adalah frame status penuh dari remote asli. Untuk
+  // perintah AC menyala + suhu, gunakan itu terlebih dahulu; fallback tetap
+  // memakai protokol IRremoteESP8266 bila belum ada rekaman suhu tersebut.
+  if (power && rawIrTemperatureLen[irTemperatureIndex(temperature)] > 0)
+    return sendIrLearnedTemperature(temperature);
+  bool usedDefaultProtocol = false;
+  if (!IRac::isProtocolSupported(acProtocol))
+  {
+    if (!IRac::isProtocolSupported(DEFAULT_AC_PROTOCOL))
+    {
+      irMessage = "Protocol AC belum dikenali dan fallback tidak tersedia";
+      return false;
+    }
+    acProtocol = DEFAULT_AC_PROTOCOL;
+    prefs.putShort("acProto", (int16_t)acProtocol);
+    usedDefaultProtocol = true;
+  }
+
+  setIrReceiverActive(false);
+  setLed(0, 0, 80);
+  Serial.printf("[IR AC] TX start: protocol=%s power=%s temp=%u pin=%u\n",
+                typeToString(acProtocol).c_str(), power ? "ON" : "OFF",
+                temperature, PIN_IR_TX);
+  IRac ac(PIN_IR_TX);
+  const bool sent = ac.sendAc(acProtocol, -1, power, mode,
+                              temperature, true, fan,
+                              stdAc::swingv_t::kOff, stdAc::swingh_t::kOff,
+                              false, false, false, false, false, false, true);
+  irStatus = sent ? "AC state sent" : "AC state gagal";
+  irMessage = sent
+    ? String(power ? "ON " : "OFF ") + String(temperature) + " C, " +
+      IRac::opmodeToString(mode) + ", fan " + IRac::fanspeedToString(fan) +
+      " via " + typeToString(acProtocol) + (usedDefaultProtocol ? " (fallback default)" : "")
+    : "Protocol tidak dapat mengirim common AC state";
+  Serial.printf("[IR AC] TX %s: %s\n", sent ? "OK" : "GAGAL", irMessage.c_str());
+  setLed(sent ? 0 : 70, sent ? 40 : 0, 0);
+  return sent;
+}
+
+bool sendAcTemperature(uint8_t temperature)
+{
+  return sendAcState(true, temperature, stdAc::opmode_t::kCool, stdAc::fanspeed_t::kAuto);
+}
+
+void serviceMqttIrRequest()
+{
+  if (pendingMqttIrRequest == MQTT_IR_NONE) return;
+  const MqttIrRequest request = pendingMqttIrRequest;
+  pendingMqttIrRequest = MQTT_IR_NONE;
+
+  if (request == MQTT_IR_SET_PROTOCOL)
+  {
+    acProtocol = pendingMqttProtocol;
+    pendingMqttProtocol = decode_type_t::UNKNOWN;
+    prefs.putShort("acProto", (int16_t)acProtocol);
+    irStatus = "Protocol AC disimpan";
+    irMessage = typeToString(acProtocol);
+    mqttStatus = "Protocol aktif: " + typeToString(acProtocol);
+    mqttLastCommandResult = mqttStatus;
+    return;
+  }
+
+  if (pendingMqttProtocol != decode_type_t::UNKNOWN)
+  {
+    acProtocol = pendingMqttProtocol;
+    pendingMqttProtocol = decode_type_t::UNKNOWN;
+    prefs.putShort("acProto", (int16_t)acProtocol);
+  }
+
+  bool sent = false;
+  if (request == MQTT_IR_RAW_ON)
+    sent = rawIrOnLen > 0 ? sendIrRaw("on") : sendAcState(true, mqttAcTemperature, mqttAcMode, mqttAcFan);
+  else if (request == MQTT_IR_RAW_OFF)
+    sent = rawIrOffLen > 0 ? sendIrRaw("off") : sendAcState(false, mqttAcTemperature, mqttAcMode, mqttAcFan);
+  else if (request == MQTT_IR_SET_STATE)
+    sent = sendAcState(true, mqttAcTemperature, mqttAcMode, mqttAcFan);
+
+  mqttStatus = sent
+    ? "Command IR berhasil: " + mqttLastCommand
+    : "Command IR gagal: " + irMessage;
+  mqttLastCommandResult = mqttStatus;
+}
+
+String normalizeVoiceText(String text)
+{
+  text.toLowerCase();
+  const char punctuation[] = {'.', ',', '?', '!', ':', ';', '-', '_', '/', '\\', '\'', '"'};
+  for (char c : punctuation) text.replace(c, ' ');
+  while (text.indexOf("  ") >= 0) text.replace("  ", " ");
+  text.trim();
+  return text;
+}
+
+bool removeWakePhrase(String &text)
+{
+  const char *phrases[] = {"halo stroomer", "hallo stroomer", "hello stroomer", "halo stromer", "hallo stromer", "stroomer", "stromer", "strummer", "streamer", "frommer"};
+  for (const char *phrase : phrases)
+  {
+    const int position = text.indexOf(phrase);
+    if (position >= 0)
+    {
+      text.remove(0, position + strlen(phrase));
+      text.trim();
+      return true;
+    }
+  }
+  return false;
+}
+
+bool commandEquals(const String &command, const char *a, const char *b = nullptr, const char *c = nullptr)
+{
+  return command == a || (b && command == b) || (c && command == c);
+}
+
+int parseTemperatureCommand(const String &command)
+{
+  if (!command.startsWith("set ") && !command.startsWith("atur ")) return -1;
+  for (size_t i = 0; i < command.length(); i++)
+  {
+    if (isDigit(command[i]))
+    {
+      const int value = command.substring(i).toInt();
+      return value >= 16 && value <= 30 ? value : -1;
+    }
+  }
+
+  const char *words[] = {
+    "enam belas", "tujuh belas", "delapan belas", "sembilan belas", "dua puluh",
+    "dua puluh satu", "dua puluh dua", "dua puluh tiga", "dua puluh empat", "dua puluh lima",
+    "dua puluh enam", "dua puluh tujuh", "dua puluh delapan", "dua puluh sembilan", "tiga puluh"
+  };
+  for (uint8_t i = 0; i < 15; i++)
+    if (command.indexOf(words[i]) >= 0) return 16 + i;
+  return -1;
+}
+
+void speakTemperatureSet(uint8_t temperature)
+{
+  VoiceClip clips[8];
+  uint8_t count = 0;
+  appendClip(clips, count, 8, VOICE_CLIP(SUHU_DIATUR));
+  appendWholeNumber(clips, count, 8, temperature);
+  appendClip(clips, count, 8, VOICE_CLIP(DERAJAT));
+  playVoiceClips(clips, count);
+}
+
+void processVoiceCommand(String transcript)
+{
+  transcript = normalizeVoiceText(transcript);
+  voiceLastTranscript = transcript;
+  const bool hasWake = removeWakePhrase(transcript);
+  const bool sessionActive = (int32_t)(voiceWakeUntilMs - millis()) > 0;
+
+  if (!hasWake && !sessionActive)
+  {
+    voiceAssistantStatus = "Diabaikan: wake word tidak ditemukan";
+    return;
+  }
+
+  if (hasWake) voiceWakeUntilMs = millis() + VOICE_WAKE_WINDOW_MS;
+  if (transcript.startsWith("tolong "))
+  {
+    transcript.remove(0, 7);
+    transcript.trim();
+  }
+  if (transcript.length() == 0)
+  {
+    voiceLastCommand = "wake";
+    voiceAssistantStatus = "Wake word aktif - menunggu perintah";
+    speakPrompt(VOICE_CLIP(SIAP));
+    return;
+  }
+
+  voiceWakeUntilMs = millis() + VOICE_WAKE_WINDOW_MS;
+  voiceLastCommand = transcript;
+  voiceAssistantStatus = "Menjalankan: " + transcript;
+
+  if (commandEquals(transcript, "berapa arus", "berapa nilai arus", "bacakan arus") || transcript == "arus")
+  {
+    if (meterData.valid) speakMeasurement(VOICE_CLIP(ARUS), meterData.current, 2, VOICE_CLIP(AMPERE));
+    else speakPrompt(VOICE_CLIP(METER_TIDAK_TERSEDIA));
+  }
+  else if (commandEquals(transcript, "berapa tegangan", "berapa nilai tegangan", "bacakan tegangan") || transcript == "tegangan")
+  {
+    if (meterData.valid) speakMeasurement(VOICE_CLIP(TEGANGAN), meterData.voltage, 1, VOICE_CLIP(VOLT));
+    else speakPrompt(VOICE_CLIP(METER_TIDAK_TERSEDIA));
+  }
+  else if (commandEquals(transcript, "berapa daya", "berapa nilai daya", "bacakan daya") || transcript == "daya")
+  {
+    if (meterData.valid) speakMeasurement(VOICE_CLIP(DAYA), meterData.activePower * 1000.0f, 0, VOICE_CLIP(WATT));
+    else speakPrompt(VOICE_CLIP(METER_TIDAK_TERSEDIA));
+  }
+  else if (commandEquals(transcript, "matikan ac", "matikan ace", "ac mati") || transcript == "matikan a ce")
+  {
+    if (sendIrRaw("off")) speakPrompt(VOICE_CLIP(AC_DIMATIKAN));
+    else speakPrompt(VOICE_CLIP(PERINTAH_TIDAK_DIKENALI));
+  }
+  else if (commandEquals(transcript, "nyalakan ac", "hidupkan ac", "ac nyala") || transcript == "nyalakan ace" || transcript == "hidupkan ace")
+  {
+    if (sendIrRaw("on")) speakPrompt(VOICE_CLIP(AC_DINYALAKAN));
+    else speakPrompt(VOICE_CLIP(PERINTAH_TIDAK_DIKENALI));
+  }
+  else if (commandEquals(transcript, "setting ac", "setting remote", "atur remote") || transcript == "setting ace")
+  {
+    remoteSetupStep = 1;
+    speakPrompt(VOICE_CLIP(TEKAN_ON_REMOTE));
+    startIrLearn(IR_LEARN_ON);
+  }
+  else
+  {
+    const int temperature = parseTemperatureCommand(transcript);
+    if (temperature >= 16 && sendAcTemperature((uint8_t)temperature))
+      speakTemperatureSet((uint8_t)temperature);
+    else
+      speakPrompt(VOICE_CLIP(PERINTAH_TIDAK_DIKENALI));
+  }
+  voiceAssistantStatus = "Siap - ucapkan Halo Stroomer";
+}
+
+void serviceVoiceAssistant()
+{
+  if (!voiceResultQueue) return;
+  VoiceRecognitionResult result;
+  if (xQueueReceive(voiceResultQueue, &result, 0) != pdTRUE) return;
+
+  if (result.httpCode >= 200 && result.httpCode < 300 && strlen(result.transcript) > 0)
+  {
+    voiceRecognitionCount++;
+    processVoiceCommand(String(result.transcript));
+  }
+  else
+  {
+    voiceRecognitionErrors++;
+    voiceAssistantStatus = result.error[0]
+      ? String(result.error) + " (HTTP " + String(result.httpCode) + ")"
+      : "Speech-to-text gagal HTTP " + String(result.httpCode);
+  }
+}
+
 void clearIrStorage()
 {
   prefs.remove("onLen");
   prefs.remove("onRaw");
   prefs.remove("offLen");
   prefs.remove("offRaw");
+  for (uint8_t temperature = IR_TEMP_MIN_C; temperature <= IR_TEMP_MAX_C; temperature++)
+  {
+    prefs.remove(irTemperatureLenKey(temperature).c_str());
+    prefs.remove(irTemperatureRawKey(temperature).c_str());
+    rawIrTemperatureLen[irTemperatureIndex(temperature)] = 0;
+  }
+  prefs.remove("acProto");
   rawIrOnLen = 0;
   rawIrOffLen = 0;
+  acProtocol = decode_type_t::UNKNOWN;
+  remoteSetupStep = 0;
   irLearnSlot = IR_LEARN_NONE;
   setIrReceiverActive(false);
   irStatus = "IR cleared";
-  irMessage = "Rekaman IR ON/OFF dihapus";
+  irMessage = "Rekaman IR ON/OFF/suhu dihapus";
 }
 
 bool runIrTransmitterTest()
@@ -1438,6 +2777,7 @@ bool validateAndParseMeterResponse(const uint8_t *response, size_t length)
   meterData.valid = true;
   meterData.lastSuccessMs = millis();
   updateEnergySession();
+  checkElectricalAlarms();
   meterStatus = "ONLINE";
   meterErrorDetail = "RX " + String(registerCount) + " register";
   return true;
@@ -1476,7 +2816,6 @@ bool readMeter()
   if (ok)
   {
     meterOkCount++;
-    publishMeterMqtt();
     setLed(0, 35, 0);
     Serial.println();
     Serial.println("[MODBUS] OK");
@@ -1524,10 +2863,29 @@ String statusJson()
   json += "\"mqttPort\":" + String(MQTT_PORT) + ",";
   json += "\"mqttDeviceId\":\"" + jsonEscape(mqttDeviceId) + "\",";
   json += "\"mqttStateTopic\":\"" + jsonEscape(mqttStateTopic) + "\",";
+  json += "\"mqttCommandTopic\":\"" + jsonEscape(mqttCommandTopic) + "\",";
+  json += "\"mqttEventTopic\":\"" + jsonEscape(mqttEventTopic) + "\",";
   json += "\"mqttStatus\":\"" + jsonEscape(mqttStatus) + "\",";
   json += "\"mqttOk\":" + String(mqttOkCount) + ",";
   json += "\"mqttErr\":" + String(mqttErrCount) + ",";
   json += "\"mqttLastPayload\":\"" + jsonEscape(lastMqttPayload) + "\",";
+  json += "\"mqttLastCommand\":\"" + jsonEscape(mqttLastCommand) + "\",";
+  json += "\"mqttLastCommandResult\":\"" + jsonEscape(mqttLastCommandResult) + "\",";
+  json += "\"mqttCommandCount\":" + String(mqttCommandCount) + ",";
+  json += "\"mqttHeartbeatSec\":" + String(mqttHeartbeatIntervalMs / 1000UL) + ",";
+  json += "\"mqttHeartbeatAgeSec\":" + String(lastMqttHeartbeatMs == 0 ? 0 : (millis() - lastMqttHeartbeatMs) / 1000UL) + ",";
+  json += "\"demandResponseEnabled\":" + String(demandResponseEnabled ? "true" : "false") + ",";
+  json += "\"demandResponseStartHour\":" + String(demandResponseStartHour) + ",";
+  json += "\"demandResponseEndHour\":" + String(demandResponseEndHour) + ",";
+  json += "\"demandResponseActive\":" + String(demandResponseActive ? "true" : "false") + ",";
+  json += "\"demandResponseStatus\":\"" + jsonEscape(demandResponseStatus) + "\",";
+  json += "\"alarmVoltageMin\":" + String(alarmVoltageMin, 1) + ",";
+  json += "\"alarmVoltageMax\":" + String(alarmVoltageMax, 1) + ",";
+  json += "\"alarmPowerMaxWatt\":" + String(alarmPowerMaxKw * 1000.0f, 0) + ",";
+  json += "\"alarmUnderVoltageActive\":" + String(alarmUnderVoltageActive ? "true" : "false") + ",";
+  json += "\"alarmOverVoltageActive\":" + String(alarmOverVoltageActive ? "true" : "false") + ",";
+  json += "\"alarmOverPowerActive\":" + String(alarmOverPowerActive ? "true" : "false") + ",";
+  json += "\"electricalAlarmStatus\":\"" + jsonEscape(electricalAlarmStatus) + "\",";
   json += "\"stations\":" + String(WiFi.softAPgetStationNum()) + ",";
   json += "\"oledReady\":" + String(oledReady ? "true" : "false") + ",";
   String oledAddressText = "-";
@@ -1535,12 +2893,27 @@ String statusJson()
   json += "\"oledAddress\":\"" + oledAddressText + "\",";
   json += "\"oledStatusDetail\":\"" + jsonEscape(oledStatusDetail) + "\",";
   json += "\"i2cScan\":\"" + jsonEscape(i2cScanResult) + "\",";
+  json += "\"voiceAssistantEnabled\":" + String(voiceAssistantEnabled ? "true" : "false") + ",";
+  json += "\"voiceCaptureActive\":" + String(voiceCaptureActive ? "true" : "false") + ",";
+  json += "\"voiceSttBusy\":" + String(voiceSttBusy ? "true" : "false") + ",";
+  json += "\"voiceWakeActive\":" + String((int32_t)(voiceWakeUntilMs - millis()) > 0 ? "true" : "false") + ",";
+  json += "\"voiceAssistantStatus\":\"" + jsonEscape(voiceAssistantStatus) + "\",";
+  json += "\"voiceLastTranscript\":\"" + jsonEscape(voiceLastTranscript) + "\",";
+  json += "\"voiceLastCommand\":\"" + jsonEscape(voiceLastCommand) + "\",";
+  json += "\"voiceRecognitionCount\":" + String(voiceRecognitionCount) + ",";
+  json += "\"voiceRecognitionErrors\":" + String(voiceRecognitionErrors) + ",";
+  json += "\"remoteSetupStep\":" + String(remoteSetupStep) + ",";
+  json += "\"acProtocol\":\"" + jsonEscape(typeToString(acProtocol)) + "\",";
   json += "\"microphoneReady\":" + String(microphoneReady ? "true" : "false") + ",";
   json += "\"microphoneTestRunning\":" + String(microphoneTestRunning ? "true" : "false") + ",";
   json += "\"microphoneStatus\":\"" + jsonEscape(microphoneStatus) + "\",";
   json += "\"microphoneTestResult\":\"" + jsonEscape(microphoneTestResult) + "\",";
   json += "\"microphoneRms\":" + String(microphoneRms) + ",";
   json += "\"microphonePeak\":" + String(microphonePeak) + ",";
+  json += "\"microphoneNoiseFloor\":" + String(microphoneNoiseFloor) + ",";
+  json += "\"microphoneVadThreshold\":" + String(microphoneVadThreshold) + ",";
+  json += "\"microphoneSpikeCount\":" + String(microphoneSpikeCount) + ",";
+  json += "\"microphoneCalibrating\":" + String((int32_t)(microphoneCalibrationUntilMs - millis()) > 0 ? "true" : "false") + ",";
   json += "\"microphoneMaxRms\":" + String(microphoneTestMaxRms) + ",";
   json += "\"microphoneMaxPeak\":" + String(microphoneTestMaxPeak) + ",";
   json += "\"microphoneChunks\":" + String(microphoneChunks) + ",";
@@ -1561,6 +2934,8 @@ String statusJson()
   json += "\"irLearn\":\"" + jsonEscape(irLearnLabel()) + "\",";
   json += "\"irOnLen\":" + String(rawIrOnLen) + ",";
   json += "\"irOffLen\":" + String(rawIrOffLen) + ",";
+  json += "\"irLearnTemperature\":" + String(irLearnTemperature) + ",";
+  json += "\"irLearnedTemperatures\":\"" + jsonEscape(learnedTemperatureList()) + "\",";
   json += "\"irTestResult\":\"" + jsonEscape(irTestResult) + "\",";
   json += "\"irTestTransitions\":" + String(irTestTransitions) + ",";
   json += "\"irTestLowSamples\":" + String(irTestLowSamples) + ",";
@@ -1571,6 +2946,7 @@ String statusJson()
   json += "\"ageMs\":" + String(ageMs) + ",";
   json += "\"totalEnergy\":" + String(meterData.totalActiveEnergy, 2) + ",";
   json += "\"EnergySession\":" + String(energySessionKwh, 4) + ",";
+  json += "\"lastEnergySession\":" + String(energySessionLastKwh, 4) + ",";
   json += "\"CountSession\":" + String(countSession) + ",";
   json += "\"energySessionActive\":" + String(energySessionActive ? "true" : "false") + ",";
   json += "\"forwardEnergy\":" + String(meterData.forwardEnergy, 2) + ",";
@@ -1711,6 +3087,45 @@ void setupWebServer()
     startMicrophoneTest();
     sendStatus();
   });
+  server.on("/mic-calibrate", [](){
+    startMicrophoneCalibration();
+    sendStatus();
+  });
+  server.on("/voice-command", [](){
+    processVoiceCommand(server.arg("text"));
+    sendStatus();
+  });
+  server.on("/voice-enable", [](){
+    voiceAssistantEnabled = server.arg("value") != "0";
+    voiceAssistantStatus = voiceAssistantEnabled
+      ? "Siap - ucapkan Halo Stroomer"
+      : "Voice assistant nonaktif";
+    sendStatus();
+  });
+  server.on("/mqtt-heartbeat", [](){
+    uint32_t seconds = server.arg("seconds").toInt();
+    if (seconds < MQTT_HEARTBEAT_MIN_SEC) seconds = MQTT_HEARTBEAT_MIN_SEC;
+    if (seconds > MQTT_HEARTBEAT_MAX_SEC) seconds = MQTT_HEARTBEAT_MAX_SEC;
+    mqttHeartbeatIntervalMs = seconds * 1000UL;
+    prefs.putUInt("mqttHbSec", seconds);
+    mqttHeartbeatDue = true;
+    mqttStatus = "Heartbeat diubah ke " + String(seconds) + " detik";
+    sendStatus();
+  });
+  server.on("/demand-response", [](){
+    const bool enabled = server.arg("enabled") == "1";
+    uint8_t startHour = (uint8_t)server.arg("start").toInt();
+    uint8_t endHour = (uint8_t)server.arg("end").toInt();
+    if (startHour > DEMAND_RESPONSE_HOUR_MAX) startHour = DEMAND_RESPONSE_HOUR_MAX;
+    if (endHour > DEMAND_RESPONSE_HOUR_MAX) endHour = DEMAND_RESPONSE_HOUR_MAX;
+    saveDemandResponseConfig(enabled, startHour, endHour);
+    demandResponseStatus = enabled ? "Jadwal disimpan - menunggu NTP" : "Tidak diset";
+    sendStatus();
+  });
+  server.on("/electrical-alarms", [](){
+    saveAlarmConfig(server.arg("voltageMin").toFloat(), server.arg("voltageMax").toFloat(), server.arg("powerMaxWatt").toFloat());
+    sendStatus();
+  });
   server.on("/wifi-save", HTTP_ANY, [](){
     const String ssid = webArg("ssid");
     const String password = webArg("password");
@@ -1737,11 +3152,28 @@ void setupWebServer()
     const String slot = server.arg("slot");
     if (slot == "on") startIrLearn(IR_LEARN_ON);
     else if (slot == "off") startIrLearn(IR_LEARN_OFF);
+    else if (slot == "temp")
+    {
+      const int temperature = server.arg("temperature").toInt();
+      if (temperature >= IR_TEMP_MIN_C && temperature <= IR_TEMP_MAX_C)
+      {
+        irLearnTemperature = (uint8_t)temperature;
+        startIrLearn(IR_LEARN_TEMPERATURE);
+      }
+      else irMessage = "Suhu learn harus 16 sampai 30 C";
+    }
     else irMessage = "Slot learn tidak dikenal";
     sendStatus();
   });
   server.on("/ir-send", [](){
     sendIrRaw(server.arg("slot"));
+    sendStatus();
+  });
+  server.on("/ir-send-temp", [](){
+    const int temperature = server.arg("temperature").toInt();
+    if (temperature >= IR_TEMP_MIN_C && temperature <= IR_TEMP_MAX_C)
+      sendIrLearnedTemperature((uint8_t)temperature);
+    else irMessage = "Suhu kirim harus 16 sampai 30 C";
     sendStatus();
   });
   server.on("/ir-tx-test", [](){
@@ -1758,6 +3190,13 @@ void setupWebServer()
   });
   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
   server.begin();
+}
+
+void configureDeviceTime()
+{
+  setenv("TZ", DEVICE_TIMEZONE, 1);
+  tzset();
+  configTime(0, 0, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY);
 }
 
 void setup()
@@ -1781,13 +3220,16 @@ void setup()
   }
   initOled();
   setupMicrophone();
+  voiceResultQueue = xQueueCreate(2, sizeof(VoiceRecognitionResult));
   setupAmplifier();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   startWifiStaConnect(false);
+  configureDeviceTime();
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+  mqttClient.setCallback(mqttMessageCallback);
   updateMqttTopics();
 
   meterSerial.begin(METER_RS485_BAUD, SERIAL_8E1, PIN_RS485_RX, PIN_RS485_TX);
@@ -1842,8 +3284,14 @@ void loop()
   server.handleClient();
   serviceWifiSta();
   serviceMqtt();
+  serviceMqttHeartbeat();
+  serviceMqttVoiceRequest();
+  serviceMqttIrRequest();
+  serviceDemandResponse();
+  serviceSystemAnnouncements();
   captureIrSignal();
   serviceMicrophone();
+  serviceVoiceAssistant();
 
   const uint32_t now = millis();
   if (irLearnSlot == IR_LEARN_NONE && meterPollingAllowed() && (now - lastMeterPollMs) >= METER_POLL_INTERVAL_MS)
