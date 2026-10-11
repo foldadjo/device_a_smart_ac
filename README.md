@@ -1,5 +1,7 @@
 # Device A — Smart AC Controller
 
+![Device A Smart AC Controller](image.png)
+
 Target hardware:
 - ESP32-S3 N16R8
 - KY-022 IR Receiver
@@ -48,6 +50,49 @@ Upload:
 ```bash
 pio run -t upload
 ```
+
+## Firmware OTA via MQTT
+
+Firmware ini mendengarkan topic global berikut:
+
+```text
+hems/device_a/update
+```
+
+Payload-nya berupa **teks URL langsung** menuju file firmware `.bin` di MinIO/web server; bukan JSON.
+Semua Device A yang online dan menggunakan firmware ini akan mengunduh URL tersebut, memasang firmware
+ke slot OTA cadangan, lalu restart.
+
+Bangun berkas firmware untuk diunggah ke MinIO:
+
+```bash
+pio run
+```
+
+File hasil build yang harus diunggah adalah:
+
+```text
+.pio/build/esp32-s3-devkitc-1/firmware.bin
+```
+
+Contoh upload ke MinIO menggunakan MinIO Client (`mc`):
+
+```bash
+mc cp .pio/build/esp32-s3-devkitc-1/firmware.bin minio/nama-bucket/device-a/firmware.bin
+```
+
+Lalu publish URL file tersebut tanpa opsi retain:
+
+```bash
+mosquitto_pub -h broker.emqx.io \
+  -t 'hems/device_a/update' \
+  -m 'https://minio.contoh.local/nama-bucket/device-a/firmware.bin'
+```
+
+URL `http://` maupun `https://` diterima, hingga 1024 karakter. Untuk kebutuhan riset ini payload
+tidak memakai checksum/signature. Update pertama tetap harus melalui USB dengan `pio run -t upload`,
+agar firmware pendukung OTA ini sudah terpasang. Status OTA dan versi firmware tampil pada tab
+**System → Koneksi**.
 
 Serial monitor:
 ```bash

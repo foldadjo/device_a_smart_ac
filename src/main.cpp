@@ -7,6 +7,7 @@
 #include <IRac.h>
 #include <IRutils.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <WebServer.h>
@@ -49,6 +50,8 @@ static const char *AP_PASSWORD = "12345678";
 static const char *DEFAULT_DEVICE_PREFIX = "hems/ac";
 static const char *MQTT_HOST = "broker.emqx.io";
 static const uint16_t MQTT_PORT = 1883;
+static const char *MQTT_OTA_TOPIC = "hems/device_a/update";
+static const char *FIRMWARE_VERSION = "1.0.0";
 
 static const uint8_t PIN_LED_RGB = 48;
 static const uint8_t PIN_IR_RX = 4;
@@ -83,6 +86,7 @@ static const uint32_t WIFI_RETRY_INTERVAL_MS = 12000;
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t MQTT_RETRY_INTERVAL_MS = 5000;
 static const uint16_t MQTT_BUFFER_SIZE = 1536;
+static const uint16_t MQTT_OTA_URL_MAX_LENGTH = 1024;
 static const uint32_t MQTT_HEARTBEAT_DEFAULT_SEC = 30;
 static const uint32_t MQTT_HEARTBEAT_MIN_SEC = 5;
 static const uint32_t MQTT_HEARTBEAT_MAX_SEC = 3600;
@@ -274,6 +278,9 @@ String mqttDeviceId = "";
 String mqttStateTopic = "";
 String mqttCommandTopic = "";
 String mqttEventTopic = "";
+String mqttOtaStatus = "Belum ada update";
+String pendingMqttOtaUrl = "";
+bool mqttOtaPending = false;
 String mqttStatus = "MQTT belum init";
 String lastMqttPayload = "-";
 String mqttLastCommand = "-";
@@ -336,6 +343,13 @@ enum SystemAnnouncement : uint8_t
   ANNOUNCE_OVER_POWER = 1 << 4
 };
 uint8_t pendingSystemAnnouncements = ANNOUNCE_NONE;
+enum SessionAnnouncement : uint8_t
+{
+  SESSION_ANNOUNCE_NONE = 0,
+  SESSION_ANNOUNCE_STARTED = 1 << 0,
+  SESSION_ANNOUNCE_STOPPED = 1 << 1
+};
+uint8_t pendingSessionAnnouncements = SESSION_ANNOUNCE_NONE;
 
 void drawOledText(const String &line1, const String &line2, const String &line3, const String &line4);
 void setIrReceiverActive(bool active);
@@ -593,7 +607,33 @@ bool mqttParseFan(const String &text, stdAc::fanspeed_t &fan)
 
 void mqttMessageCallback(char *topic, byte *payload, unsigned int length)
 {
-  if (String(topic) != mqttCommandTopic || length == 0 || length > 256) return;
+  if (length == 0) return;
+
+  const String receivedTopic(topic);
+  if (receivedTopic == MQTT_OTA_TOPIC)
+  {
+    if (length > MQTT_OTA_URL_MAX_LENGTH)
+    {
+      mqttOtaStatus = "OTA ditolak: URL terlalu panjang";
+      return;
+    }
+    String url;
+    url.reserve(length);
+    for (unsigned int i = 0; i < length; i++) url += (char)payload[i];
+    url.trim(); // URL tidak di-lowercase; presigned URL bersifat case-sensitive.
+    if (!(url.startsWith("http://") || url.startsWith("https://")))
+    {
+      mqttOtaStatus = "OTA ditolak: URL harus http/https";
+      return;
+    }
+    pendingMqttOtaUrl = url;
+    mqttOtaPending = true;
+    mqttOtaStatus = "URL OTA diterima, menunggu download";
+    mqttStatus = mqttOtaStatus;
+    return;
+  }
+
+  if (receivedTopic != mqttCommandTopic || length > 256) return;
 
   String command;
   command.reserve(length);
@@ -758,11 +798,13 @@ void connectMqtt()
   if (mqttClient.connect(clientId.c_str()))
   {
     mqttHeartbeatDue = true;
-    if (mqttClient.subscribe(mqttCommandTopic.c_str()))
-      mqttStatus = "MQTT connected + subscribed";
+    const bool controlSubscribed = mqttClient.subscribe(mqttCommandTopic.c_str());
+    const bool otaSubscribed = mqttClient.subscribe(MQTT_OTA_TOPIC);
+    if (controlSubscribed && otaSubscribed)
+      mqttStatus = "MQTT connected + control/OTA subscribed";
     else
     {
-      mqttStatus = "MQTT connected, subscribe gagal";
+      mqttStatus = "MQTT connected, subscribe control/OTA gagal";
       mqttErrCount++;
     }
     return;
@@ -790,6 +832,53 @@ void serviceMqtt()
   {
     connectMqtt();
   }
+}
+
+void serviceMqttOta()
+{
+  if (!mqttOtaPending) return;
+  mqttOtaPending = false;
+
+  if (!internetReady())
+  {
+    mqttOtaStatus = "OTA gagal: WiFi STA tidak terhubung";
+    mqttStatus = mqttOtaStatus;
+    return;
+  }
+
+  const String url = pendingMqttOtaUrl;
+  pendingMqttOtaUrl = "";
+  mqttOtaStatus = "OTA download dimulai";
+  mqttStatus = mqttOtaStatus;
+  publishMqttEvent("ota_started", url);
+  delay(80); // Beri waktu paket event MQTT keluar sebelum koneksi dipakai OTA.
+
+  t_httpUpdate_return result = HTTP_UPDATE_FAILED;
+  if (url.startsWith("https://"))
+  {
+    WiFiClientSecure otaClient;
+    otaClient.setInsecure(); // Mode riset: HTTPS terenkripsi tanpa validasi sertifikat CA.
+    result = httpUpdate.update(otaClient, url, FIRMWARE_VERSION);
+  }
+  else
+  {
+    WiFiClient otaClient;
+    result = httpUpdate.update(otaClient, url, FIRMWARE_VERSION);
+  }
+
+  // HTTP_UPDATE_OK normally reboots automatically. This branch is retained
+  // for frameworks configured not to reboot automatically.
+  if (result == HTTP_UPDATE_OK)
+  {
+    mqttOtaStatus = "OTA selesai, restart";
+    publishMqttEvent("ota_complete", FIRMWARE_VERSION);
+    delay(100);
+    ESP.restart();
+  }
+
+  mqttOtaStatus = "OTA gagal: " + httpUpdate.getLastErrorString();
+  mqttStatus = mqttOtaStatus;
+  publishMqttEvent("ota_failed", mqttOtaStatus);
 }
 
 bool publishMeterMqtt()
@@ -855,6 +944,7 @@ void updateEnergySession()
     countSession++;
     prefs.putUInt("cntSess", countSession);
     publishMqttEvent("session_started", "Daya di atas 10 Watt");
+    pendingSessionAnnouncements |= SESSION_ANNOUNCE_STARTED;
   }
   else if (activeNow)
   {
@@ -866,6 +956,7 @@ void updateEnergySession()
     energySessionActive = false;
     energySessionLastKwh = energySessionKwh;
     publishMqttEvent("session_stopped", "Daya di bawah 10 Watt; energi=" + String(energySessionLastKwh, 4) + " kWh");
+    pendingSessionAnnouncements |= SESSION_ANNOUNCE_STOPPED;
   }
 }
 
@@ -1611,6 +1702,20 @@ bool playVoiceClips(const VoiceClip *clips, uint8_t count)
 bool speakPrompt(VoiceClip clip)
 {
   return playVoiceClips(&clip, 1);
+}
+
+// Session is determined from the actual meter power, not merely from an IR
+// command. This keeps the spoken state aligned with MQTT session events.
+void serviceSessionAnnouncements()
+{
+  if (pendingSessionAnnouncements == SESSION_ANNOUNCE_NONE) return;
+  const uint8_t announcement = pendingSessionAnnouncements & (uint8_t)(-(int8_t)pendingSessionAnnouncements);
+  pendingSessionAnnouncements &= ~announcement;
+
+  if (announcement == SESSION_ANNOUNCE_STARTED)
+    speakPrompt(VOICE_CLIP(AC_DINYALAKAN));
+  else if (announcement == SESSION_ANNOUNCE_STOPPED)
+    speakPrompt(VOICE_CLIP(AC_DIMATIKAN));
 }
 
 bool speakMeasurement(VoiceClip prefix, float value, uint8_t decimals, VoiceClip unit)
@@ -2865,6 +2970,9 @@ String statusJson()
   json += "\"mqttStateTopic\":\"" + jsonEscape(mqttStateTopic) + "\",";
   json += "\"mqttCommandTopic\":\"" + jsonEscape(mqttCommandTopic) + "\",";
   json += "\"mqttEventTopic\":\"" + jsonEscape(mqttEventTopic) + "\",";
+  json += "\"mqttOtaTopic\":\"" + String(MQTT_OTA_TOPIC) + "\",";
+  json += "\"firmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\",";
+  json += "\"mqttOtaStatus\":\"" + jsonEscape(mqttOtaStatus) + "\",";
   json += "\"mqttStatus\":\"" + jsonEscape(mqttStatus) + "\",";
   json += "\"mqttOk\":" + String(mqttOkCount) + ",";
   json += "\"mqttErr\":" + String(mqttErrCount) + ",";
@@ -3284,11 +3392,13 @@ void loop()
   server.handleClient();
   serviceWifiSta();
   serviceMqtt();
+  serviceMqttOta();
   serviceMqttHeartbeat();
   serviceMqttVoiceRequest();
   serviceMqttIrRequest();
   serviceDemandResponse();
   serviceSystemAnnouncements();
+  serviceSessionAnnouncements();
   captureIrSignal();
   serviceMicrophone();
   serviceVoiceAssistant();
